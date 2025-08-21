@@ -1,0 +1,19 @@
+[Unit]
+Description=Cognee API Service
+After=network.target
+
+[Service]
+Type=simple
+User=xdien
+WorkingDirectory=/home/xdien/cognee-api
+Environment=PATH=/home/xdien/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/xdien/cognee-api
+EnvironmentFile=/home/xdien/cognee-api/.env
+ExecStart=/usr/bin/python3 -m uvicorn api_wrapper:app --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
