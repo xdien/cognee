@@ -37,7 +37,7 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
     return credentials.credentials
 
 @app.get("/health")
-async def health_check():
+async def health_check(api_key: str = Depends(verify_api_key)):
     return {"status": "healthy", "service": "cognee-api"}
 
 @app.post("/api/add")
@@ -312,14 +312,7 @@ async def prune_data(request: Request, api_key: str = Depends(verify_api_key)):
         logger.error(f"Error pruning data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-# Health Check
-@app.get("/api/health")
-async def health_check():
-    return {
-        "status": "healthy",
-        "service": "cognee-api-wrapper",
-        "version": "1.0.0"
-    }
+# Health Check endpoint removed - using /health instead
 
 # Search Types Info
 @app.get("/api/search/types")
