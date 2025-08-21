@@ -53,29 +53,29 @@ More on [use-cases](https://docs.cognee.ai/use-cases) and [evals](https://github
 
 # 🚀 Cognee API Wrapper - Enhanced Version
 
-**API wrapper nâng cao cho Cognee với đầy đủ tính năng GraphRAG**
+**Advanced API wrapper for Cognee with complete GraphRAG features**
 
-## ✨ Tính năng mới được thêm vào
+## ✨ New Features Added
 
-### 🔍 **Search nâng cao**
-- ✅ Hỗ trợ 8 loại search types: `SUMMARIES`, `INSIGHTS`, `CHUNKS`, `RAG_COMPLETION`, `GRAPH_COMPLETION`, `CODE`, `CYPHER`, `NATURAL_LANGUAGE`
-- ✅ Search trong datasets cụ thể
-- ✅ Tùy chỉnh số lượng kết quả (top_k)
+### 🔍 **Advanced Search**
+- ✅ Support for 8 search types: `SUMMARIES`, `INSIGHTS`, `CHUNKS`, `RAG_COMPLETION`, `GRAPH_COMPLETION`, `CODE`, `CYPHER`, `NATURAL_LANGUAGE`
+- ✅ Search within specific datasets
+- ✅ Customizable result count (top_k)
 - ✅ Multi-dataset search
 
 ### 📁 **Dataset Management**
-- ✅ Tạo, xóa, liệt kê datasets
-- ✅ Thêm dữ liệu vào dataset cụ thể
-- ✅ Search trong dataset riêng biệt
+- ✅ Create, delete, list datasets
+- ✅ Add data to specific datasets
+- ✅ Search within individual datasets
 
 ### 📤 **File Upload & Multimedia**
-- ✅ Upload và xử lý PDF, audio, images
-- ✅ Hỗ trợ multimedia processing
-- ✅ Tự động cleanup temporary files
+- ✅ Upload and process PDF, audio, images
+- ✅ Multimedia processing support
+- ✅ Automatic temporary file cleanup
 
 ### ⚙️ **Database Configuration**
-- ✅ Chuyển đổi database providers (Neo4j, FalkorDB, PostgreSQL)
-- ✅ Cấu hình LLM và embedding models
+- ✅ Switch database providers (Neo4j, FalkorDB, PostgreSQL)
+- ✅ Configure LLM and embedding models
 - ✅ Real-time configuration updates
 
 ### 📊 **Visualization & Graph**
@@ -88,11 +88,11 @@ More on [use-cases](https://docs.cognee.ai/use-cases) and [evals](https://github
 - ✅ Health checks
 - ✅ System state management
 
-## 🆚 So sánh với phiên bản cũ
+## 🆚 Comparison with Previous Version
 
-| Tính năng | Phiên bản cũ | **Phiên bản mới** |
-|-----------|--------------|-------------------|
-| Search types | 1 (mặc định) | **8 types** |
+| Feature | Previous Version | **New Version** |
+|---------|------------------|------------------|
+| Search types | 1 (default) | **8 types** |
 | Dataset support | ❌ | **✅** |
 | File upload | ❌ | **✅** |
 | Database config | ❌ | **✅** |
@@ -100,21 +100,21 @@ More on [use-cases](https://docs.cognee.ai/use-cases) and [evals](https://github
 | Cleanup operations | ❌ | **✅** |
 | Health checks | ❌ | **✅** |
 | Multimedia support | ❌ | **✅** |
-| **Tận dụng Cognee** | **15-20%** | **80-90%** |
+| **Cognee Utilization** | **15-20%** | **80-90%** |
 
 ## 🚀 Quick Start
 
 ```bash
-# Chạy API wrapper
+# Run API wrapper
 python api_wrapper.py
 
-# Server chạy tại: http://localhost:8000
+# Server runs at: http://localhost:8000
 ```
 
-### Ví dụ sử dụng nâng cao:
+### Advanced Usage Examples:
 
 ```bash
-# 1. Search với Graph Completion
+# 1. Search with Graph Completion
 curl -X POST "http://localhost:8000/api/search" \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
@@ -131,7 +131,7 @@ curl -X POST "http://localhost:8000/api/upload" \
   -F "file=@document.pdf" \
   -F "dataset=my_dataset"
 
-# 3. Cấu hình Neo4j
+# 3. Configure Neo4j
 curl -X POST "http://localhost:8000/api/config" \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
@@ -143,7 +143,7 @@ curl -X POST "http://localhost:8000/api/config" \
 
 ## 📚 API Documentation
 
-Xem file `api_wrapper.py` để biết chi tiết tất cả endpoints:
+See `api_wrapper.py` file for detailed information about all endpoints:
 
 - **Search**: `/api/search` - 8 search types
 - **Datasets**: `/api/datasets` - CRUD operations
