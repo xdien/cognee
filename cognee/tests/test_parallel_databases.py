@@ -33,20 +33,22 @@ async def main():
         "vector_db_url": "cognee1.test",
         "vector_db_key": "",
         "vector_db_provider": "lancedb",
+        "vector_db_name": "",
     }
     task_2_config = {
         "vector_db_url": "cognee2.test",
         "vector_db_key": "",
         "vector_db_provider": "lancedb",
+        "vector_db_name": "",
     }
 
     task_1_graph_config = {
-        "graph_database_provider": "kuzu",
-        "graph_file_path": "kuzu1.db",
+        "graph_database_provider": "ladybug",
+        "graph_file_path": "ladybug1.db",
     }
     task_2_graph_config = {
-        "graph_database_provider": "kuzu",
-        "graph_file_path": "kuzu2.db",
+        "graph_database_provider": "ladybug",
+        "graph_file_path": "ladybug2.db",
     }
 
     # schedule both cognify calls concurrently

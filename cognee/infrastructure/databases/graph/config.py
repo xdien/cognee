@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 import pydantic
 from pydantic import Field
 from cognee.base_config import get_base_config
+from cognee.root_dir import ensure_absolute_path
 from cognee.shared.data_models import KnowledgeGraph
 
 
@@ -25,6 +26,7 @@ class GraphConfig(BaseSettings):
     - graph_database_username
     - graph_database_password
     - graph_database_port
+    - graph_database_key
     - graph_file_path
     - graph_model
     - graph_topology
@@ -33,37 +35,57 @@ class GraphConfig(BaseSettings):
 
     # Using Field we are able to dynamically load current GRAPH_DATABASE_PROVIDER value in the model validator part
     # and determine default graph db file and path based on this parameter if no values are provided
-    graph_database_provider: str = Field("kuzu", env="GRAPH_DATABASE_PROVIDER")
+    graph_database_provider: str = Field("ladybug", env="GRAPH_DATABASE_PROVIDER")
 
     graph_database_url: str = ""
     graph_database_name: str = ""
     graph_database_username: str = ""
     graph_database_password: str = ""
+    graph_database_allow_anonymous: bool = False
     graph_database_port: int = 123
+    graph_database_key: str = ""
     graph_file_path: str = ""
     graph_filename: str = ""
     graph_model: object = KnowledgeGraph
     graph_topology: object = KnowledgeGraph
+    graph_dataset_database_handler: str = "ladybug"
     model_config = SettingsConfigDict(env_file=".env", extra="allow", populate_by_name=True)
 
     # Model validator updates graph_filename and path dynamically after class creation based on current database provider
     # If no specific graph_filename or path are provided
     @pydantic.model_validator(mode="after")
-    def fill_derived(cls, values):
-        provider = values.graph_database_provider.lower()
+    def fill_derived(self):
+        provider = self.graph_database_provider.lower()
+        self.graph_database_provider = provider
+        graph_dataset_database_handler = self.graph_dataset_database_handler.lower()
+        self.graph_dataset_database_handler = graph_dataset_database_handler
+        if provider == "kuzu" and graph_dataset_database_handler == "ladybug":
+            self.graph_dataset_database_handler = "kuzu"
+        base_config = get_base_config()
 
-        # Set default filename if no filename is provided
-        if not values.graph_filename:
-            values.graph_filename = f"cognee_graph_{provider}"
+        databases_directory_path = os.path.join(base_config.system_root_directory, "databases")
 
-        # Set file path based on graph database provider if no file path is provided
-        if not values.graph_file_path:
-            base_config = get_base_config()
+        # Set default filename if no filename is provided. For the Ladybug rename, keep using an
+        # existing default Kuzu database path so local users do not silently start with an empty graph.
+        if not self.graph_filename:
+            graph_directory = self.graph_file_path or databases_directory_path
+            self.graph_filename = f"cognee_graph_{provider}"
+            if provider == "ladybug":
+                legacy_graph_path = os.path.join(graph_directory, "cognee_graph_kuzu")
+                if os.path.exists(legacy_graph_path):
+                    self.graph_filename = "cognee_graph_kuzu"
 
-            databases_directory_path = os.path.join(base_config.system_root_directory, "databases")
-            values.graph_file_path = os.path.join(databases_directory_path, values.graph_filename)
+        # Handle graph file path
+        if self.graph_file_path:
+            # Check if absolute path is provided
+            self.graph_file_path = ensure_absolute_path(
+                os.path.join(self.graph_file_path, self.graph_filename)
+            )
+        else:
+            # Default path
+            self.graph_file_path = os.path.join(databases_directory_path, self.graph_filename)
 
-        return values
+        return self
 
     def to_dict(self) -> dict:
         """
@@ -83,11 +105,14 @@ class GraphConfig(BaseSettings):
             "graph_database_url": self.graph_database_url,
             "graph_database_username": self.graph_database_username,
             "graph_database_password": self.graph_database_password,
+            "graph_database_allow_anonymous": self.graph_database_allow_anonymous,
             "graph_database_port": self.graph_database_port,
+            "graph_database_key": self.graph_database_key,
             "graph_file_path": self.graph_file_path,
             "graph_model": self.graph_model,
             "graph_topology": self.graph_topology,
             "model_config": self.model_config,
+            "graph_dataset_database_handler": self.graph_dataset_database_handler,
         }
 
     def to_hashable_dict(self) -> dict:
@@ -109,8 +134,11 @@ class GraphConfig(BaseSettings):
             "graph_database_name": self.graph_database_name,
             "graph_database_username": self.graph_database_username,
             "graph_database_password": self.graph_database_password,
+            "graph_database_allow_anonymous": self.graph_database_allow_anonymous,
             "graph_database_port": self.graph_database_port,
+            "graph_database_key": self.graph_database_key,
             "graph_file_path": self.graph_file_path,
+            "graph_dataset_database_handler": self.graph_dataset_database_handler,
         }
 
 

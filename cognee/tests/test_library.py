@@ -6,6 +6,7 @@ from cognee.modules.search.operations import get_history
 from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
 from cognee.modules.search.types import SearchType
+from cognee import update
 
 logger = get_logger()
 
@@ -42,16 +43,16 @@ async def main():
 
     await cognee.add([text], dataset_name)
 
-    await cognee.cognify([dataset_name])
+    cognify_run_info = await cognee.cognify([dataset_name])
 
     from cognee.infrastructure.databases.vector import get_vector_engine
 
     vector_engine = get_vector_engine()
-    random_node = (await vector_engine.search("Entity_name", "AI"))[0]
+    random_node = (await vector_engine.search("Entity_name", "AI", include_payload=True))[0]
     random_node_name = random_node.payload["text"]
 
     search_results = await cognee.search(
-        query_type=SearchType.INSIGHTS, query_text=random_node_name
+        query_type=SearchType.GRAPH_COMPLETION, query_text=random_node_name
     )
     assert len(search_results) != 0, "The search results list is empty."
     print("\n\nExtracted sentences are:\n")
@@ -76,6 +77,36 @@ async def main():
     history = await get_history(user.id)
 
     assert len(history) == 6, "Search history is not correct."
+
+    # Test updating of documents
+    # Get Pipeline Run object
+    pipeline_run_obj = list(cognify_run_info.values())[0]
+    for data_item in pipeline_run_obj.data_ingestion_info:
+        # Update all documents in dataset to only contain Mark and Cindy information
+        await update(
+            dataset_id=pipeline_run_obj.dataset_id,
+            data_id=data_item["data_id"],
+            data="Mark met with Cindy at a cafe.",
+        )
+
+    search_results = await cognee.search(
+        query_type=SearchType.GRAPH_COMPLETION,
+        query_text="What information do you contain?",
+        dataset_ids=[pipeline_run_obj.dataset_id],
+    )
+    result_text = search_results[0]["search_result"][0].lower()
+    assert "mark" in result_text, "Failed to update document, no mention of Mark in search results"
+    assert "cindy" in result_text, (
+        "Failed to update document, no mention of Cindy in search results"
+    )
+    assert "artificial intelligence" not in result_text, (
+        "Failed to update document, Artificial intelligence still mentioned in search results"
+    )
+
+    # Test visualization
+    from cognee import visualize_graph
+
+    await visualize_graph()
 
     # Assert local data files are cleaned properly
     await cognee.prune.prune_data()
@@ -103,11 +134,11 @@ async def main():
     from cognee.infrastructure.databases.graph import get_graph_config
 
     graph_config = get_graph_config()
-    # For Kuzu v0.11.0+, check if database file doesn't exist (single-file format with .kuzu extension)
+    # For Ladybug/Kuzu, check if database file doesn't exist.
     # For older versions or other providers, check if directory is empty
-    if graph_config.graph_database_provider.lower() == "kuzu":
+    if graph_config.graph_database_provider.lower() in ("ladybug", "kuzu"):
         assert not os.path.exists(graph_config.graph_file_path), (
-            "Kuzu graph database file still exists"
+            "Ladybug graph database file still exists"
         )
     else:
         assert not os.path.exists(graph_config.graph_file_path) or not os.listdir(

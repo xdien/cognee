@@ -1,7 +1,9 @@
-from typing import List, Protocol, Optional, Union, Any
+from typing import List, Protocol, Optional, Any
 from abc import abstractmethod
 from cognee.infrastructure.engine import DataPoint
 from .models.PayloadSchema import PayloadSchema
+from uuid import UUID
+from cognee.modules.users.models import User
 
 
 class VectorDBInterface(Protocol):
@@ -83,8 +85,11 @@ class VectorDBInterface(Protocol):
         collection_name: str,
         query_text: Optional[str],
         query_vector: Optional[List[float]],
-        limit: int,
+        limit: Optional[int],
         with_vector: bool = False,
+        include_payload: bool = False,
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a search in the specified collection using either a text query or a vector
@@ -98,15 +103,26 @@ class VectorDBInterface(Protocol):
               collection.
             - query_vector (Optional[List[float]]): An optional vector representation for
               searching the collection.
-            - limit (int): The maximum number of results to return from the search.
+            - limit (Optional[int]): The maximum number of results to return from the search.
             - with_vector (bool): Whether to return the vector representations with search
               results. (default False)
+            - include_payload (bool): Whether to include the payload data with search. Search is faster when set to False.
+              Payload contains metadata about the data point, useful for searches that are only based on embedding distances
+              like the RAG_COMPLETION search type, but not needed when search also contains graph data.
+            - node_name (Optional[List[str]]): An optional list of names of nodes. Search results are filtered
+              based on these, and only data which has at least one of the names in its "belongs_to_set" field is returned.
         """
         raise NotImplementedError
 
     @abstractmethod
     async def batch_search(
-        self, collection_name: str, query_texts: List[str], limit: int, with_vectors: bool = False
+        self,
+        collection_name: str,
+        query_texts: List[str],
+        limit: Optional[int],
+        with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: Optional[List[str]] = None,
     ):
         """
         Perform a batch search using multiple text queries against a collection.
@@ -116,16 +132,17 @@ class VectorDBInterface(Protocol):
 
             - collection_name (str): The name of the collection to conduct the batch search in.
             - query_texts (List[str]): A list of text queries to use for the search.
-            - limit (int): The maximum number of results to return for each query.
+            - limit (Optional[int]): The maximum number of results to return for each query.
             - with_vectors (bool): Whether to include vector representations with search
               results. (default False)
+            - include_payload (bool): Whether to include the payload data with search. Search is faster when set to False.
+              Payload contains metadata about the data point, useful for searches that are only based on embedding distances
+              like the RAG_COMPLETION search type, but not needed when search also contains graph data.
         """
         raise NotImplementedError
 
     @abstractmethod
-    async def delete_data_points(
-        self, collection_name: str, data_point_ids: Union[List[str], list[str]]
-    ):
+    async def delete_data_points(self, collection_name: str, data_point_ids: List[UUID]):
         """
         Delete specified data points from a collection.
 
@@ -163,6 +180,13 @@ class VectorDBInterface(Protocol):
         raise NotImplementedError
 
     # Optional methods that may be implemented by adapters
+    async def run_migrations(self):
+        """
+        Run adapter-specific vector storage migrations.
+        Default implementation is a no-op.
+        """
+        return None
+
     async def get_connection(self):
         """
         Get a connection to the vector database.
@@ -213,3 +237,36 @@ class VectorDBInterface(Protocol):
             - Any: The schema object suitable for this vector database
         """
         return model_type
+
+    @classmethod
+    async def create_dataset(cls, dataset_id: Optional[UUID], user: Optional[User]) -> dict:
+        """
+        Return a dictionary with connection info for a vector database for the given dataset.
+        Function can auto handle deploying of the actual database if needed, but is not necessary.
+        Only providing connection info is sufficient, this info will be mapped when trying to connect to the provided dataset in the future.
+        Needed for Cognee multi-tenant/multi-user and backend access control support.
+
+        Dictionary returned from this function will be used to create a DatasetDatabase row in the relational database.
+        From which internal mapping of dataset -> database connection info will be done.
+
+        Each dataset needs to map to a unique vector database when backend access control is enabled to facilitate a separation of concern for data.
+
+        Args:
+            dataset_id: UUID of the dataset if needed by the database creation logic
+            user: User object if needed by the database creation logic
+        Returns:
+            dict: Connection info for the created vector database instance.
+        """
+        pass
+
+    async def delete_dataset(self, dataset_id: UUID, user: User) -> None:
+        """
+        Delete the vector database for the given dataset.
+        Function should auto handle deleting of the actual database or send a request to the proper service to delete the database.
+        Needed for maintaining a database for Cognee multi-tenant/multi-user and backend access control.
+
+        Args:
+            dataset_id: UUID of the dataset
+            user: User object
+        """
+        pass

@@ -1,8 +1,9 @@
-from typing import List, Any
+from typing import Any
 
 from ..tokenizer_interface import TokenizerInterface
 
 
+# NOTE: DEPRECATED as to count tokens you need to send an API request to Google it is too slow to use with Cognee
 class GeminiTokenizer(TokenizerInterface):
     """
     Implements a tokenizer interface for the Gemini model, managing token extraction and
@@ -16,11 +17,11 @@ class GeminiTokenizer(TokenizerInterface):
 
     def __init__(
         self,
-        model: str,
-        max_tokens: int = 3072,
-    ):
-        self.model = model
-        self.max_tokens = max_tokens
+        llm_model: str,
+        max_completion_tokens: int = 3072,
+    ) -> None:
+        self.llm_model = llm_model
+        self.max_completion_tokens = max_completion_tokens
 
         # Get LLM API key from config
         from cognee.infrastructure.databases.vector.embeddings.config import get_embedding_config
@@ -28,14 +29,13 @@ class GeminiTokenizer(TokenizerInterface):
             get_llm_config,
         )
 
-        config = get_embedding_config()
         llm_config = get_llm_config()
 
-        import google.generativeai as genai
+        from google import genai  # ty:ignore[unresolved-import]
 
-        genai.configure(api_key=config.embedding_api_key or llm_config.llm_api_key)
+        self.client = genai.Client(api_key=llm_config.llm_api_key)
 
-    def extract_tokens(self, text: str) -> List[Any]:
+    def extract_tokens(self, text: str) -> list[Any]:
         """
         Raise NotImplementedError when called, as this method should be implemented in a
         subclass.
@@ -47,7 +47,7 @@ class GeminiTokenizer(TokenizerInterface):
         """
         raise NotImplementedError
 
-    def decode_single_token(self, encoding: int):
+    def decode_single_token(self, token: int) -> str:
         """
         Raise NotImplementedError when called, as Gemini tokenizer does not support decoding of
         tokens.
@@ -77,6 +77,7 @@ class GeminiTokenizer(TokenizerInterface):
 
             - int: The number of tokens in the given text.
         """
-        import google.generativeai as genai
 
-        return len(genai.embed_content(model=f"models/{self.model}", content=text))
+        tokens_response = self.client.models.count_tokens(model=self.llm_model, contents=text)
+
+        return tokens_response.total_tokens

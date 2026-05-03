@@ -1,31 +1,83 @@
-import os
-import sys
+import importlib.metadata
 import logging
-import structlog
-import traceback
+import logging.handlers
+import os
 import platform
+import sys
+import tempfile
+import traceback
+from collections.abc import MutableMapping
 from datetime import datetime
 from pathlib import Path
-import importlib.metadata
+from typing import Any, Protocol
 
-from cognee import __version__ as cognee_version
-from typing import Protocol
+import structlog
+
+
+def _get_cognee_version() -> str:
+    """Get version without importing cognee (avoids triggering __init__.py)."""
+    import importlib.metadata as _meta
+    from contextlib import suppress
+
+    with suppress(FileNotFoundError, StopIteration):
+        _pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"
+        with open(_pyproject, encoding="utf-8") as f:
+            _ver = (
+                next(line for line in f if line.startswith("version")).split("=")[1].strip("'\"\n ")
+            )
+            return f"{_ver}-local"
+    try:
+        return _meta.version("cognee")
+    except _meta.PackageNotFoundError:
+        return "unknown"
+
+
+cognee_version = _get_cognee_version()
 
 
 # Configure external library logging
-def configure_external_library_logging():
-    """Configure logging for external libraries to reduce verbosity"""
-    # Configure LiteLLM logging to reduce verbosity
-    try:
-        import litellm
+def configure_external_library_logging() -> None:
+    """Configure logging for external libraries to reduce verbosity.
 
-        litellm.set_verbose = False
+    Sets env vars eagerly (cheap) but only configures litellm's Python
+    objects if litellm is already imported. If not, the env vars are
+    enough — litellm reads them on its own import.
+    """
+    # Set environment variables to suppress LiteLLM logging.
+    # litellm reads these on import, so setting them early is sufficient
+    # even if litellm hasn't been imported yet.
+    os.environ.setdefault("LITELLM_LOG", "ERROR")
+    os.environ.setdefault("LITELLM_SET_VERBOSE", "False")
 
-        # Suppress LiteLLM ERROR logging using standard logging
-        logging.getLogger("litellm").setLevel(logging.CRITICAL)
-    except ImportError:
-        # LiteLLM not available, skip configuration
-        pass
+    # Suppress loggers by name (works even before litellm is imported —
+    # Python's logging module pre-creates the logger objects).
+    loggers_to_suppress = [
+        "litellm",
+        "litellm.litellm_core_utils.logging_worker",
+        "litellm.litellm_core_utils",
+        "litellm.proxy",
+        "litellm.router",
+        "openai._base_client",
+        "LiteLLM",
+        "LiteLLM.core",
+        "LiteLLM.logging_worker",
+        "litellm.logging_worker",
+    ]
+    for logger_name in loggers_to_suppress:
+        logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+        logging.getLogger(logger_name).disabled = True
+
+    # Only touch litellm's module-level flags if it's already imported.
+    # This avoids a ~900ms cold import just to set verbose=False.
+    litellm = sys.modules.get("litellm")
+    if litellm is not None:
+        litellm.set_verbose = False  # ty:ignore[unresolved-attribute]
+        if hasattr(litellm, "suppress_debug_info"):
+            litellm.suppress_debug_info = True  # ty:ignore[unresolved-attribute]
+        if hasattr(litellm, "turn_off_message"):
+            litellm.turn_off_message = True  # ty:ignore[unresolved-attribute]
+        if hasattr(litellm, "_turn_on_debug"):
+            litellm._turn_on_debug = False  # ty:ignore[unresolved-attribute]
 
 
 # Export common log levels
@@ -47,12 +99,45 @@ log_levels = {
 # Track if structlog logging has been configured
 _is_structlog_configured = False
 
-# Path to logs directory
-LOGS_DIR = Path(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "logs"))
-LOGS_DIR.mkdir(exist_ok=True)  # Create logs dir if it doesn't exist
+
+def resolve_logs_dir() -> Path | None:
+    """Resolve a writable logs directory.
+
+    Priority:
+    1) BaseConfig.logs_root_directory (respects COGNEE_LOGS_DIR)
+    2) /tmp/cognee_logs (default, best-effort create)
+
+    Returns a Path or None if none are writable/creatable.
+    """
+    from cognee.base_config import get_base_config
+
+    base_config = get_base_config()
+    logs_root_directory = Path(base_config.logs_root_directory)
+
+    try:
+        logs_root_directory.mkdir(parents=True, exist_ok=True)
+        if os.access(logs_root_directory, os.W_OK):
+            return logs_root_directory
+    except Exception:
+        pass
+
+    try:
+        tmp_log_path = Path(os.path.join("/tmp", "cognee_logs"))
+        tmp_log_path.mkdir(parents=True, exist_ok=True)
+        if os.access(tmp_log_path, os.W_OK):
+            return tmp_log_path
+    except Exception:
+        pass
+
+    return None
+
 
 # Maximum number of log files to keep
 MAX_LOG_FILES = 10
+
+# Log rotation defaults — override via COGNEE_LOG_MAX_BYTES / COGNEE_LOG_BACKUP_COUNT
+LOG_MAX_BYTES = int(os.getenv("COGNEE_LOG_MAX_BYTES", 50 * 1024 * 1024))  # 50 MB
+LOG_BACKUP_COUNT = int(os.getenv("COGNEE_LOG_BACKUP_COUNT", 5))  # 5 backups → 300 MB cap
 
 # Version information
 PYTHON_VERSION = platform.python_version()
@@ -62,10 +147,14 @@ COGNEE_VERSION = cognee_version
 OS_INFO = f"{platform.system()} {platform.release()} ({platform.version()})"
 
 
-class PlainFileHandler(logging.FileHandler):
-    """A custom file handler that writes simpler plain text log entries."""
+class PlainFileHandler(logging.handlers.RotatingFileHandler):
+    """A rotating file handler that writes simpler plain text log entries.
 
-    def emit(self, record):
+    Inherits from RotatingFileHandler so log files are automatically rotated
+    when they reach maxBytes, keeping at most backupCount old files.
+    """
+
+    def emit(self, record) -> None:
         try:
             # Check if stream is available before trying to write
             if self.stream is None:
@@ -138,19 +227,12 @@ class PlainFileHandler(logging.FileHandler):
         except Exception as e:
             self.handleError(record)
             # Write error about handling this record
-            self.stream.write(f"Error in log handler: {e}\n")
+            if self.stream:
+                self.stream.write(f"Error in log handler: {e}\n")
             self.flush()
 
 
-class LoggerInterface(Protocol):
-    def info(self, msg: str, *args, **kwargs) -> None: ...
-    def warning(self, msg: str, *args, **kwargs) -> None: ...
-    def error(self, msg: str, *args, **kwargs) -> None: ...
-    def critical(self, msg: str, *args, **kwargs) -> None: ...
-    def debug(self, msg: str, *args, **kwargs) -> None: ...
-
-
-def get_logger(name=None, level=None) -> LoggerInterface:
+def get_logger(name=None, level=None) -> logging.Logger:
     """Get a logger.
 
     If `setup_logging()` has not been called, returns a standard Python logger.
@@ -165,40 +247,28 @@ def get_logger(name=None, level=None) -> LoggerInterface:
         return logger
 
 
-def log_database_configuration(logger):
+def log_database_configuration(logger) -> None:
     """Log the current database configuration for all database types"""
     # NOTE: Has to be imporated at runtime to avoid circular import
+    from cognee.infrastructure.databases.graph.config import get_graph_config
     from cognee.infrastructure.databases.relational.config import get_relational_config
     from cognee.infrastructure.databases.vector.config import get_vectordb_config
-    from cognee.infrastructure.databases.graph.config import get_graph_config
 
     try:
-        # Log relational database configuration
-        relational_config = get_relational_config()
-        if relational_config.db_provider == "postgres":
-            logger.info(f"Postgres host: {relational_config.db_host}:{relational_config.db_port}")
-        elif relational_config.db_provider == "sqlite":
-            logger.info(f"SQLite path: {relational_config.db_path}")
+        # Get base database directory path
+        from cognee.base_config import get_base_config
 
-        # Log vector database configuration
-        vector_config = get_vectordb_config()
-        if vector_config.vector_db_provider == "lancedb":
-            logger.info(f"Vector database path: {vector_config.vector_db_url}")
-        else:
-            logger.info(f"Vector database URL: {vector_config.vector_db_url}")
+        base_config = get_base_config()
+        databases_path = os.path.join(base_config.system_root_directory, "databases")
 
-        # Log graph database configuration
-        graph_config = get_graph_config()
-        if graph_config.graph_database_provider == "kuzu":
-            logger.info(f"Graph database path: {graph_config.graph_file_path}")
-        else:
-            logger.info(f"Graph database URL: {graph_config.graph_database_url}")
+        # Log concise database info
+        logger.info(f"Database storage: {databases_path}")
 
     except Exception as e:
-        logger.warning(f"Could not retrieve database configuration: {str(e)}")
+        logger.debug(f"Could not retrieve database configuration: {str(e)}")
 
 
-def cleanup_old_logs(logs_dir, max_files):
+def cleanup_old_logs(logs_dir, max_files) -> bool:
     """
     Removes old log files, keeping only the most recent ones.
 
@@ -216,12 +286,21 @@ def cleanup_old_logs(logs_dir, max_files):
 
         # Remove old files that exceed the maximum
         if len(log_files) > max_files:
+            deleted_count = 0
             for old_file in log_files[max_files:]:
                 try:
                     old_file.unlink()
-                    logger.info(f"Deleted old log file: {old_file}")
+                    deleted_count += 1
+                    # Only log individual files in non-CLI mode
+                    if os.getenv("COGNEE_CLI_MODE") != "true":
+                        logger.info(f"Deleted old log file: {old_file}")
                 except Exception as e:
+                    # Always log errors
                     logger.error(f"Failed to delete old log file {old_file}: {e}")
+
+            # In CLI mode, show compact summary
+            if os.getenv("COGNEE_CLI_MODE") == "true" and deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old log files")
 
         return True
     except Exception as e:
@@ -229,7 +308,7 @@ def cleanup_old_logs(logs_dir, max_files):
         return False
 
 
-def setup_logging(log_level=None, name=None):
+def setup_logging(log_level=None, name=None) -> bool:
     """Sets up the logging configuration with structlog integration.
 
     Args:
@@ -241,13 +320,87 @@ def setup_logging(log_level=None, name=None):
     """
     global _is_structlog_configured
 
-    log_level = log_level if log_level else log_levels[os.getenv("LOG_LEVEL", "INFO")]
+    # Regular detailed logging for non-CLI usage
+    log_level = log_level if log_level else log_levels[os.getenv("LOG_LEVEL", "INFO").upper()]
 
     # Configure external library logging early to suppress verbose output
     configure_external_library_logging()
 
-    def exception_handler(logger, method_name, event_dict):
+    # Add custom filter to suppress LiteLLM worker cancellation errors
+    class LiteLLMCancellationFilter(logging.Filter):
+        """Filter to suppress LiteLLM worker cancellation messages"""
+
+        def filter(self, record):
+            # Check if this is a LiteLLM-related logger
+            if hasattr(record, "name") and "litellm" in record.name.lower():
+                return False
+
+            # Check message content for cancellation errors
+            if hasattr(record, "msg") and record.msg:
+                msg_str = str(record.msg).lower()
+                if any(
+                    keyword in msg_str
+                    for keyword in [
+                        "loggingworker cancelled",
+                        "logging_worker.py",
+                        "cancellederror",
+                        "litellm:error",
+                    ]
+                ):
+                    return False
+
+            # Check formatted message
+            try:
+                if hasattr(record, "getMessage"):
+                    formatted_msg = record.getMessage().lower()
+                    if any(
+                        keyword in formatted_msg
+                        for keyword in [
+                            "loggingworker cancelled",
+                            "logging_worker.py",
+                            "cancellederror",
+                            "litellm:error",
+                        ]
+                    ):
+                        return False
+            except Exception:
+                pass
+
+            return True
+
+    # Apply the filter to root logger and specific loggers
+    cancellation_filter = LiteLLMCancellationFilter()
+    logging.getLogger().addFilter(cancellation_filter)
+    logging.getLogger("litellm").addFilter(cancellation_filter)
+
+    # Add custom filter to suppress LiteLLM worker cancellation errors
+    class LiteLLMFilter(logging.Filter):
+        def filter(self, record) -> bool:
+            # Suppress LiteLLM worker cancellation errors
+            if hasattr(record, "msg") and isinstance(record.msg, str):
+                msg_lower = record.msg.lower()
+                if any(
+                    phrase in msg_lower
+                    for phrase in [
+                        "loggingworker cancelled",
+                        "cancellederror",
+                        "logging_worker.py",
+                        "loggingerror",
+                    ]
+                ):
+                    return False
+            return True
+
+    # Apply filter to root logger
+    litellm_filter = LiteLLMFilter()
+    logging.getLogger().addFilter(litellm_filter)
+
+    def exception_handler(
+        logger: Any, method_name: str, event_dict: MutableMapping[str, Any]
+    ) -> dict[str, Any]:
         """Custom processor to handle uncaught exceptions."""
+        event_dict = dict(event_dict)
+
         # Check if there's an exc_info that needs to be processed
         if event_dict.get("exc_info"):
             # If it's already a tuple, use it directly
@@ -256,7 +409,7 @@ def setup_logging(log_level=None, name=None):
             else:
                 exc_type, exc_value, tb = sys.exc_info()
 
-            if hasattr(exc_type, __name__):
+            if exc_type and hasattr(exc_type, __name__):
                 event_dict["exception_type"] = exc_type.__name__
             event_dict["exception_message"] = str(exc_value)
             event_dict["traceback"] = True
@@ -283,7 +436,7 @@ def setup_logging(log_level=None, name=None):
     )
 
     # Set up system-wide exception handling
-    def handle_exception(exc_type, exc_value, traceback):
+    def handle_exception(exc_type, exc_value, traceback) -> None:
         """Handle any uncaught exception."""
         if issubclass(exc_type, KeyboardInterrupt):
             # Let KeyboardInterrupt pass through
@@ -297,11 +450,6 @@ def setup_logging(log_level=None, name=None):
         )
         # Hand back to the original hook → prints traceback and exits
         sys.__excepthook__(exc_type, exc_value, traceback)
-
-        logger.info("Want to learn more? Visit the Cognee documentation: https://docs.cognee.ai")
-        logger.info(
-            "Need help? Reach out to us on our Discord server: https://discord.gg/NQPKmU5CCg"
-        )
 
     # Install exception handlers
     sys.excepthook = handle_exception
@@ -319,16 +467,18 @@ def setup_logging(log_level=None, name=None):
                 "warning": structlog.dev.YELLOW,
                 "info": structlog.dev.GREEN,
                 "debug": structlog.dev.BLUE,
-            },
+            },  # ty:ignore[invalid-argument-type]
         ),
     )
 
     # Setup handler with newlines for console output
     class NewlineStreamHandler(logging.StreamHandler):
-        def emit(self, record):
+        def emit(self, record) -> None:
             try:
                 msg = self.format(record)
                 stream = self.stream
+                if hasattr(stream, "closed") and stream.closed:
+                    return
                 stream.write("\n" + msg + self.terminator)
                 self.flush()
             except Exception:
@@ -339,28 +489,51 @@ def setup_logging(log_level=None, name=None):
     stream_handler.setFormatter(console_formatter)
     stream_handler.setLevel(log_level)
 
-    # Check if we already have a log file path from the environment
-    # NOTE: environment variable must be used here as it allows us to
-    # log to a single file with a name based on a timestamp in a multiprocess setting.
-    # Without it, we would have a separate log file for every process.
-    log_file_path = os.environ.get("LOG_FILE_NAME")
-    if not log_file_path:
-        # Create a new log file name with the cognee start time
-        start_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_file_path = os.path.join(LOGS_DIR, f"{start_time}.log")
-        os.environ["LOG_FILE_NAME"] = log_file_path
-
-    # Create a file handler that uses our custom PlainFileHandler
-    file_handler = PlainFileHandler(log_file_path, encoding="utf-8")
-    file_handler.setLevel(DEBUG)
-
-    # Configure root logger
     root_logger = logging.getLogger()
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
     root_logger.addHandler(stream_handler)
-    root_logger.addHandler(file_handler)
-    root_logger.setLevel(log_level)
+
+    # Note: root logger needs to be set at NOTSET to allow all messages through and specific stream and file handlers
+    # can define their own levels.
+    root_logger.setLevel(logging.NOTSET)
+
+    # --- File logging (opt-out via COGNEE_LOG_FILE=false) ---
+    # Set COGNEE_LOG_FILE=false to disable file logging entirely.
+    log_file_enabled = os.getenv("COGNEE_LOG_FILE", "true").lower() not in ("false", "0", "no")
+    log_file_path = None
+
+    if log_file_enabled:
+        # Resolve logs directory with env and safe fallbacks
+        logs_dir = resolve_logs_dir()
+
+        # Check if we already have a log file path from the environment
+        # NOTE: environment variable must be used here as it allows us to
+        # log to a single file with a name based on a timestamp in a multiprocess setting.
+        # Without it, we would have a separate log file for every process.
+        log_file_path = os.environ.get("LOG_FILE_NAME")
+        if not log_file_path and logs_dir is not None:
+            # Create a new log file name with the cognee start time
+            start_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_file_path = str((logs_dir / f"{start_time}.log").resolve())
+            os.environ["LOG_FILE_NAME"] = log_file_path
+
+        try:
+            # Rotating file handler: caps each file at LOG_MAX_BYTES,
+            # keeps LOG_BACKUP_COUNT old files (default 50 MB × 5 = 250 MB total).
+            file_handler = PlainFileHandler(
+                log_file_path,  # ty:ignore[invalid-argument-type]
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(log_level)
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            # Logging to file is not mandatory — warn on console and continue.
+            root_logger.warning(
+                f"Warning: Could not create log file handler at {log_file_path}: {e}"
+            )
 
     if log_level > logging.DEBUG:
         import warnings
@@ -375,31 +548,58 @@ def setup_logging(log_level=None, name=None):
         )
 
     # Clean up old log files, keeping only the most recent ones
-    cleanup_old_logs(LOGS_DIR, MAX_LOG_FILES)
+    if log_file_enabled and logs_dir is not None:
+        cleanup_old_logs(logs_dir, MAX_LOG_FILES)
 
     # Mark logging as configured
     _is_structlog_configured = True
 
-    # Get a configured logger and log system information
+    # Get a configured logger
     logger = structlog.get_logger(name if name else __name__)
+
+    if log_file_path is not None:
+        logger.info(f"Log file created at: {log_file_path}", log_file=log_file_path)
+
+    # Defer heavy database config logging to first actual pipeline use.
+    # Importing graph/vector/relational configs triggers litellm (~900ms)
+    # and other heavy dependencies. Log basic info now, details later.
+    _log_deferred_info(logger)
+
+    return logger
+
+
+def _log_deferred_info(logger) -> None:
+    """Log lightweight startup info. Heavy DB config is logged on first pipeline call."""
+    logger.warning(
+        "Cognee 1.0 changes: "
+        "New API — remember/recall/forget/improve (V1 add/cognify/search still work). "
+        "Session memory enabled by default (CACHING=false to disable). "
+        "Multi-user access control on by default (ENABLE_BACKEND_ACCESS_CONTROL=false to disable). "
+        "Agents (@cognee.agent) auto-verified on registration. "
+        "See https://docs.cognee.ai/"
+    )
+
+    try:
+        from cognee.base_config import get_base_config
+
+        base_config = get_base_config()
+        databases_path = os.path.join(base_config.system_root_directory, "databases")
+    except Exception:
+        databases_path = "unknown"
+
     logger.info(
         "Logging initialized",
         python_version=PYTHON_VERSION,
         structlog_version=STRUCTLOG_VERSION,
         cognee_version=COGNEE_VERSION,
         os_info=OS_INFO,
+        database_path=databases_path,
     )
 
-    logger.info("Want to learn more? Visit the Cognee documentation: https://docs.cognee.ai")
-
-    # Log database configuration
-    log_database_configuration(logger)
-
-    # Return the configured logger
-    return logger
+    logger.info(f"Database storage: {databases_path}")
 
 
-def get_log_file_location():
+def get_log_file_location() -> str | None:
     """Return the file path of the log file in use, if any."""
     root_logger = logging.getLogger()
 
@@ -409,7 +609,7 @@ def get_log_file_location():
             return handler.baseFilename
 
 
-def get_timestamp_format():
+def get_timestamp_format() -> str:
     # NOTE: Some users have complained that Cognee crashes when trying to get microsecond value
     #       Added handler to not use microseconds if users can't access it
     logger = structlog.get_logger()

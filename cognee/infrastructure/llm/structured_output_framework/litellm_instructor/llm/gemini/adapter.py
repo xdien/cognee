@@ -1,146 +1,189 @@
-import litellm
-from pydantic import BaseModel
-from typing import Type, Optional
-from litellm import acompletion, JSONSchemaValidationError
+"""Adapter for Gemini API LLM provider"""
 
-from cognee.shared.logging_utils import get_logger
+import logging
+from typing import Any
+
+import instructor
+import litellm
+from instructor.core import InstructorRetryException
+from litellm.exceptions import ContentPolicyViolationError
+from openai import ContentFilterFinishReasonError
+from pydantic import BaseModel
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_not_exception_type,
+    stop_after_delay,
+    wait_exponential_jitter,
+)
+
+from cognee.infrastructure.llm.exceptions import ContentPolicyFilterError
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.generic_llm_api.adapter import (
+    GenericAPIAdapter,
+)
 from cognee.modules.observability.get_observe import get_observe
-from cognee.exceptions import InvalidValueError
-from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.llm_interface import (
-    LLMInterface,
-)
-from cognee.infrastructure.llm.LLMGateway import LLMGateway
-from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.rate_limiter import (
-    rate_limit_async,
-    sleep_and_retry_async,
-)
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.rate_limiting import llm_rate_limiter_context_manager
 
 logger = get_logger()
 observe = get_observe()
 
 
-class GeminiAdapter(LLMInterface):
+class GeminiAdapter(GenericAPIAdapter):
     """
-    Handles interactions with a language model API.
+    Adapter for Gemini API LLM provider.
 
-    Public methods include:
-    - acreate_structured_output
-    - show_prompt
+    This class initializes the API adapter with necessary credentials and configurations for
+    interacting with the gemini LLM models. It provides methods for creating structured outputs
+    based on user input and system prompts, as well as multimodal processing capabilities.
+
+    Public methods:
+    - acreate_structured_output(text_input: str, system_prompt: str, response_model: Type[BaseModel]) -> BaseModel
+    - create_transcript(input) -> BaseModel: Transcribe audio files to text
+    - transcribe_image(input) -> BaseModel: Inherited from GenericAPIAdapter
     """
 
-    MAX_RETRIES = 5
+    default_instructor_mode = "json_mode"
 
     def __init__(
         self,
         api_key: str,
         model: str,
-        max_tokens: int,
-        endpoint: Optional[str] = None,
-        api_version: Optional[str] = None,
-        streaming: bool = False,
+        max_completion_tokens: int,
+        endpoint: str | None = None,
+        api_version: str | None = None,
+        transcription_model: str | None = None,
+        instructor_mode: str | None = None,
+        fallback_model: str | None = None,
+        fallback_api_key: str | None = None,
+        fallback_endpoint: str | None = None,
+        llm_args: dict[str, Any] | None = None,
     ) -> None:
-        self.api_key = api_key
-        self.model = model
-        self.endpoint = endpoint
-        self.api_version = api_version
-        self.streaming = streaming
-        self.max_tokens = max_tokens
+        super().__init__(
+            api_key=api_key,
+            model=model,
+            max_completion_tokens=max_completion_tokens,
+            name="Gemini",
+            endpoint=endpoint,
+            api_version=api_version,
+            transcription_model=transcription_model,
+            fallback_model=fallback_model,
+            fallback_api_key=fallback_api_key,
+            fallback_endpoint=fallback_endpoint,
+            llm_args=llm_args,
+        )
+        self.llm_args: dict[str, Any] = llm_args or {}
+        self.instructor_mode = instructor_mode if instructor_mode else self.default_instructor_mode
+
+        self.aclient = instructor.from_litellm(
+            litellm.acompletion, mode=instructor.Mode(self.instructor_mode)
+        )
 
     @observe(as_type="generation")
-    @sleep_and_retry_async()
-    @rate_limit_async
+    @retry(
+        stop=stop_after_delay(128),
+        wait=wait_exponential_jitter(8, 128),
+        retry=retry_if_not_exception_type(
+            (litellm.exceptions.NotFoundError, litellm.exceptions.AuthenticationError)
+        ),
+        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        reraise=True,
+    )
     async def acreate_structured_output(
-        self, text_input: str, system_prompt: str, response_model: Type[BaseModel]
+        self, text_input: str, system_prompt: str, response_model: type[BaseModel], **kwargs
     ) -> BaseModel:
         """
-        Generate structured output from the language model based on the provided input and
-        system prompt.
+        Generate a response from a user query.
 
-        This method handles retries and raises a ValueError if the request fails or the response
-        does not conform to the expected schema, logging errors accordingly.
+        This asynchronous method sends a user query and a system prompt to a language model and
+        retrieves the generated response. It handles API communication and retries up to a
+        specified limit in case of request failures.
 
         Parameters:
         -----------
 
-            - text_input (str): The user input text to generate a response for.
-            - system_prompt (str): The system's prompt or context to influence the language
-              model's generation.
-            - response_model (Type[BaseModel]): A model type indicating the expected format of
-              the response.
+            - text_input (str): The input text from the user to generate a response for.
+            - system_prompt (str): A prompt that provides context or instructions for the
+              response generation.
+            - response_model (Type[BaseModel]): A Pydantic model that defines the structure of
+              the expected response.
 
         Returns:
         --------
 
-            - BaseModel: Returns the generated response as an instance of the specified response
-              model.
+            - BaseModel: An instance of the specified response model containing the structured
+              output from the language model.
         """
+
+        merged_kwargs = {**self.llm_args, **kwargs}
         try:
-            if response_model is str:
-                response_schema = {"type": "string"}
-            else:
-                response_schema = response_model
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text_input},
-            ]
-
-            try:
-                response = await acompletion(
-                    model=f"{self.model}",
-                    messages=messages,
+            async with llm_rate_limiter_context_manager():
+                return await self.aclient.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": f"""{text_input}""",
+                        },
+                    ],
                     api_key=self.api_key,
-                    max_tokens=self.max_tokens,
-                    temperature=0.1,
-                    response_format=response_schema,
-                    timeout=100,
-                    num_retries=self.MAX_RETRIES,
+                    max_retries=2,
+                    api_base=self.endpoint,
+                    api_version=self.api_version,
+                    response_model=response_model,
+                    **merged_kwargs,
+                )
+        except (
+            ContentFilterFinishReasonError,
+            ContentPolicyViolationError,
+            InstructorRetryException,
+        ) as error:
+            if (
+                isinstance(error, InstructorRetryException)
+                and "content management policy" not in str(error).lower()
+            ):
+                raise error
+
+            if not (self.fallback_model and self.fallback_api_key and self.fallback_endpoint):
+                raise ContentPolicyFilterError(
+                    f"The provided input contains content that is not aligned with our content policy: {text_input}"
                 )
 
-                if response.choices and response.choices[0].message.content:
-                    content = response.choices[0].message.content
-                    if response_model is str:
-                        return content
-                    return response_model.model_validate_json(content)
-
-            except litellm.exceptions.BadRequestError as e:
-                logger.error(f"Bad request error: {str(e)}")
-                raise ValueError(f"Invalid request: {str(e)}")
-
-            raise ValueError("Failed to get valid response after retries")
-
-        except JSONSchemaValidationError as e:
-            logger.error(f"Schema validation failed: {str(e)}")
-            logger.debug(f"Raw response: {e.raw_response}")
-            raise ValueError(f"Response failed schema validation: {str(e)}")
-
-    def show_prompt(self, text_input: str, system_prompt: str) -> str:
-        """
-        Format and display the prompt for a user query.
-
-        Raises an InvalidValueError if no system prompt is provided.
-
-        Parameters:
-        -----------
-
-            - text_input (str): The user input text to display along with the system prompt.
-            - system_prompt (str): The path or content of the system prompt to be read and
-              displayed.
-
-        Returns:
-        --------
-
-            - str: Returns a formatted string containing the system prompt and user input.
-        """
-        if not text_input:
-            text_input = "No user input provided."
-        if not system_prompt:
-            raise InvalidValueError(message="No system prompt path provided.")
-        system_prompt = LLMGateway.read_query_prompt(system_prompt)
-
-        formatted_prompt = (
-            f"""System Prompt:\n{system_prompt}\n\nUser Input:\n{text_input}\n"""
-            if system_prompt
-            else None
-        )
-        return formatted_prompt
+            try:
+                async with llm_rate_limiter_context_manager():
+                    return await self.aclient.chat.completions.create(
+                        model=self.fallback_model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": system_prompt,
+                            },
+                            {
+                                "role": "user",
+                                "content": f"""{text_input}""",
+                            },
+                        ],
+                        max_retries=2,
+                        api_key=self.fallback_api_key,
+                        api_base=self.fallback_endpoint,
+                        response_model=response_model,
+                        **merged_kwargs,
+                    )
+            except (
+                ContentFilterFinishReasonError,
+                ContentPolicyViolationError,
+                InstructorRetryException,
+            ) as error:
+                if (
+                    isinstance(error, InstructorRetryException)
+                    and "content management policy" not in str(error).lower()
+                ):
+                    raise error
+                else:
+                    raise ContentPolicyFilterError(
+                        f"The provided input contains content that is not aligned with our content policy: {text_input}"
+                    )

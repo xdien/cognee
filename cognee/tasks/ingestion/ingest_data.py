@@ -6,6 +6,7 @@ from typing import Union, BinaryIO, Any, List, Optional
 import cognee.modules.ingestion as ingestion
 from cognee.infrastructure.databases.relational import get_relational_engine
 from cognee.modules.data.models import Data
+from cognee.modules.ingestion.exceptions import IngestionError
 from cognee.modules.users.models import User
 from cognee.modules.users.methods import get_default_user
 from cognee.modules.users.permissions.methods import get_specific_user_permission_datasets
@@ -19,6 +20,7 @@ from cognee.modules.data.methods import (
 
 from .save_data_item_to_storage import save_data_item_to_storage
 from .data_item_to_text_file import data_item_to_text_file
+from .data_item import DataItem
 
 
 async def ingest_data(
@@ -27,7 +29,8 @@ async def ingest_data(
     user: User,
     node_set: Optional[List[str]] = None,
     dataset_id: UUID = None,
-    preferred_loaders: List[str] = None,
+    preferred_loaders: dict[str, dict[str, Any]] = None,
+    importance_weight: float = 0.5,
 ):
     if not user:
         user = await get_default_user()
@@ -44,7 +47,7 @@ async def ingest_data(
         user: User,
         node_set: Optional[List[str]] = None,
         dataset_id: UUID = None,
-        preferred_loaders: List[str] = None,
+        preferred_loaders: dict[str, dict[str, Any]] = None,
     ):
         new_datapoints = []
         existing_data_points = []
@@ -76,24 +79,42 @@ async def ingest_data(
         dataset_data: list[Data] = await get_dataset_data(dataset.id)
         dataset_data_map = {str(data.id): True for data in dataset_data}
 
-        for data_item in data:
-            # Get file path of data item or create a file it doesn't exist
-            original_file_path = await save_data_item_to_storage(data_item)
+        db_engine = get_relational_engine()
 
+        for data_item in data:
+            # Support for DataItem (custom label + data + optional data_id / external_metadata)
+            current_label = None
+            underlying_data = data_item
+            item_data_id = None
+            item_external_metadata = None
+
+            if isinstance(data_item, DataItem):
+                underlying_data = data_item.data
+                current_label = data_item.label
+                item_data_id = data_item.data_id
+                item_external_metadata = data_item.external_metadata
+
+            # Get file path of data item or create a file if it doesn't exist
+            original_file_path = await save_data_item_to_storage(underlying_data)
             # Transform file path to be OS usable
             actual_file_path = get_data_file_path(original_file_path)
 
             # Store all input data as text files in Cognee data storage
             cognee_storage_file_path, loader_engine = await data_item_to_text_file(
-                actual_file_path, preferred_loaders
+                actual_file_path,
+                preferred_loaders,
             )
 
+            if loader_engine is None:
+                raise IngestionError("Loader cannot be None")
+
             # Find metadata from original file
+            # Standard flow: extract metadata from both original and stored files
             async with open_data_file(original_file_path) as file:
                 classified_data = ingestion.classify(file)
 
                 # data_id is the hash of original file contents + owner id to avoid duplicate data
-                data_id = ingestion.identify(classified_data, user)
+                data_id = await ingestion.identify(classified_data, user)
                 original_file_metadata = classified_data.get_metadata()
 
             # Find metadata from Cognee data storage text file
@@ -101,9 +122,12 @@ async def ingest_data(
                 classified_data = ingestion.classify(file)
                 storage_file_metadata = classified_data.get_metadata()
 
-            from sqlalchemy import select
+            # If the DataItem carries a stable data_id (e.g. from DLT), use it
+            # instead of the content-hash-based ID.
+            if item_data_id is not None:
+                data_id = item_data_id
 
-            db_engine = get_relational_engine()
+            from sqlalchemy import select
 
             # Check to see if data should be updated
             async with db_engine.get_async_session() as session:
@@ -114,10 +138,18 @@ async def ingest_data(
             # TODO: Maybe allow getting of external metadata through ingestion loader?
             ext_metadata = get_external_metadata_dict(data_item)
 
+            # Merge DataItem.external_metadata if present
+            if item_external_metadata:
+                ext_metadata.update(item_external_metadata)
+
             if node_set:
                 ext_metadata["node_set"] = node_set
 
             if data_point is not None:
+                # Content-change detection: reset pipeline_status when content changed
+                new_content_hash = original_file_metadata["content_hash"]
+                content_changed = str(data_point.content_hash) != str(new_content_hash)
+
                 data_point.name = original_file_metadata["name"]
                 data_point.raw_data_location = cognee_storage_file_path
                 data_point.original_data_location = original_file_metadata["file_path"]
@@ -127,12 +159,16 @@ async def ingest_data(
                 data_point.original_mime_type = original_file_metadata["mime_type"]
                 data_point.loader_engine = loader_engine.loader_name
                 data_point.owner_id = user.id
-                data_point.content_hash = original_file_metadata["content_hash"]
+                data_point.content_hash = new_content_hash
                 data_point.raw_content_hash = storage_file_metadata["content_hash"]
                 data_point.file_size = original_file_metadata["file_size"]
                 data_point.external_metadata = ext_metadata
                 data_point.node_set = json.dumps(node_set) if node_set else None
                 data_point.tenant_id = user.tenant_id if user.tenant_id else None
+                data_point.label = current_label
+
+                if content_changed:
+                    data_point.pipeline_status = {}
 
                 # Check if data is already in dataset
                 if str(data_point.id) in dataset_data_map:
@@ -163,6 +199,8 @@ async def ingest_data(
                     tenant_id=user.tenant_id if user.tenant_id else None,
                     pipeline_status={},
                     token_count=-1,
+                    label=current_label,
+                    importance_weight=importance_weight,
                 )
 
                 new_datapoints.append(data_point)
@@ -189,5 +227,10 @@ async def ingest_data(
         return existing_data_points + dataset_new_data_points + new_datapoints
 
     return await store_data_to_dataset(
-        data, dataset_name, user, node_set, dataset_id, preferred_loaders
+        data,
+        dataset_name,
+        user,
+        node_set,
+        dataset_id,
+        preferred_loaders,
     )

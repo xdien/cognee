@@ -1,4 +1,5 @@
-from typing import List, Any, Optional
+from typing import Any
+
 import tiktoken
 
 from ..tokenizer_interface import TokenizerInterface
@@ -12,19 +13,19 @@ class TikTokenTokenizer(TokenizerInterface):
 
     def __init__(
         self,
-        model: Optional[str] = None,
-        max_tokens: int = 8191,
-    ):
+        model: str | None = None,
+        max_completion_tokens: int = 8191,
+    ) -> None:
         self.model = model
-        self.max_tokens = max_tokens
+        self.max_completion_tokens = max_completion_tokens
         # Initialize TikToken for GPT based on model
         if model:
-            self.tokenizer = tiktoken.encoding_for_model(self.model)
+            self.tokenizer = tiktoken.encoding_for_model(model)
         else:
             # Use default if model not provided
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
-    def extract_tokens(self, text: str) -> List[Any]:
+    def extract_tokens(self, text: str) -> list[Any]:
         """
         Extract tokens from the given text.
 
@@ -42,7 +43,7 @@ class TikTokenTokenizer(TokenizerInterface):
         token_ids = self.tokenizer.encode(text)
         return token_ids
 
-    def decode_token_list(self, tokens: List[Any]) -> List[Any]:
+    def decode_token_list(self, tokens: list[Any]) -> list[Any]:
         """
         Decode a list of token IDs back into their corresponding text representations.
 
@@ -60,7 +61,7 @@ class TikTokenTokenizer(TokenizerInterface):
             tokens = [tokens]
         return [self.tokenizer.decode(i) for i in tokens]
 
-    def decode_single_token(self, token: int):
+    def decode_single_token(self, token: int) -> str:
         """
         Decode a single token ID into its corresponding text representation.
 
@@ -93,9 +94,9 @@ class TikTokenTokenizer(TokenizerInterface):
         num_tokens = len(self.tokenizer.encode(text))
         return num_tokens
 
-    def trim_text_to_max_tokens(self, text: str) -> str:
+    def trim_text_to_max_completion_tokens(self, text: str) -> str:
         """
-        Trim the text so that the number of tokens does not exceed max_tokens.
+        Trim the text so that the number of tokens does not exceed max_completion_tokens.
 
         Parameters:
         -----------
@@ -111,13 +112,13 @@ class TikTokenTokenizer(TokenizerInterface):
         num_tokens = self.count_tokens(text)
 
         # If the number of tokens is within the limit, return the text as is
-        if num_tokens <= self.max_tokens:
+        if num_tokens <= self.max_completion_tokens:
             return text
 
         # If the number exceeds the limit, trim the text
         # This is a simple trim, it may cut words in half; consider using word boundaries for a cleaner cut
         encoded_text = self.tokenizer.encode(text)
-        trimmed_encoded_text = encoded_text[: self.max_tokens]
+        trimmed_encoded_text = encoded_text[: self.max_completion_tokens]
         # Decoding the trimmed text
         trimmed_text = self.tokenizer.decode(trimmed_encoded_text)
         return trimmed_text

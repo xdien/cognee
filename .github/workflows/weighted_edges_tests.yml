@@ -2,20 +2,20 @@ name: Weighted Edges Tests
 
 on:
   push:
-    branches: [ main, weighted_edges ]
+    branches: [ main, dev, weighted_edges]
     paths:
       - 'cognee/modules/graph/utils/get_graph_from_model.py'
       - 'cognee/infrastructure/engine/models/Edge.py'
       - 'cognee/tests/unit/interfaces/graph/test_weighted_edges.py'
-      - 'examples/python/weighted_edges_example.py'
+      - 'examples/demos/dynamic_multiple_weighted_edges_example.py'
       - '.github/workflows/weighted_edges_tests.yml'
   pull_request:
-    branches: [ main ]
+    branches: [ main, dev ]
     paths:
       - 'cognee/modules/graph/utils/get_graph_from_model.py'
       - 'cognee/infrastructure/engine/models/Edge.py'
       - 'cognee/tests/unit/interfaces/graph/test_weighted_edges.py'
-      - 'examples/python/weighted_edges_example.py'
+      - 'examples/demos/dynamic_multiple_weighted_edges_example.py'
       - '.github/workflows/weighted_edges_tests.yml'
 
 env:
@@ -31,12 +31,12 @@ jobs:
         python-version: ['3.11', '3.12']
     env:
       LLM_PROVIDER: openai
-      LLM_MODEL: gpt-4o-mini
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_MODEL: gpt-5-mini
+      LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -47,11 +47,11 @@ jobs:
 
       - name: Run Weighted Edges Unit Tests
         run: |
-          poetry run pytest cognee/tests/unit/interfaces/graph/test_weighted_edges.py -v --tb=short
+          uv run pytest cognee/tests/unit/interfaces/graph/test_weighted_edges.py -v --tb=short
 
       - name: Run Standard Graph Tests (Regression)
         run: |
-          poetry run pytest cognee/tests/unit/interfaces/graph/get_graph_from_model_unit_test.py -v --tb=short
+          uv run pytest cognee/tests/unit/interfaces/graph/get_graph_from_model_unit_test.py -v --tb=short
 
   test-with-different-databases:
     name: Test Weighted Edges with Different Graph Databases
@@ -61,25 +61,23 @@ jobs:
         database: ['kuzu', 'neo4j']
         include:
           - database: kuzu
-            install_extra: ""
             graph_db_provider: "kuzu"
           - database: neo4j
-            install_extra: "-E neo4j"
             graph_db_provider: "neo4j"
     env:
       LLM_PROVIDER: openai
-      LLM_MODEL: gpt-4o-mini
-      LLM_ENDPOINT: https://api.openai.com/v1/
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_MODEL: gpt-5-mini
+      LLM_ENDPOINT: https://api.openai.com/v1
+      LLM_API_KEY: ${{ secrets.OPENAI_API_KEY  }}
       LLM_API_VERSION: "2024-02-01"
-      EMBEDDING_PROVIDER: openai
-      EMBEDDING_MODEL: text-embedding-3-small
-      EMBEDDING_ENDPOINT: https://api.openai.com/v1/
-      EMBEDDING_API_KEY: ${{ secrets.LLM_API_KEY }}
-      EMBEDDING_API_VERSION: "2024-02-01"
+      EMBEDDING_DIMENSIONS: 300
+      EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+      EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+      EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+      EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -88,33 +86,41 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Database Dependencies
-        run: |
-          poetry install ${{ matrix.install_extra }}
+      - name: Setup Neo4j with GDS
+        uses: ./.github/actions/setup_neo4j
+        id: neo4j
+
+      - name: Dependencies already installed
+        run: echo "Dependencies already installed in setup"
 
       - name: Run Weighted Edges Tests
         env:
+          ENABLE_BACKEND_ACCESS_CONTROL: 'false'
           GRAPH_DATABASE_PROVIDER: ${{ matrix.graph_db_provider }}
+          GRAPH_DATABASE_URL: ${{ matrix.graph_db_provider == 'neo4j' && steps.neo4j.outputs.neo4j-url || '' }}
+          GRAPH_DATABASE_USERNAME: ${{ matrix.graph_db_provider == 'neo4j' && steps.neo4j.outputs.neo4j-username || '' }}
+          GRAPH_DATABASE_PASSWORD: ${{ matrix.graph_db_provider == 'neo4j' && steps.neo4j.outputs.neo4j-password || '' }}
         run: |
-          poetry run pytest cognee/tests/unit/interfaces/graph/test_weighted_edges.py -v --tb=short
+          uv run pytest cognee/tests/unit/interfaces/graph/test_weighted_edges.py -v --tb=short
 
   test-examples:
     name: Test Weighted Edges Examples
     runs-on: ubuntu-22.04
     env:
       LLM_PROVIDER: openai
-      LLM_MODEL: gpt-4o-mini
-      LLM_ENDPOINT: https://api.openai.com/v1/
-      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_MODEL: gpt-5-mini
+      LLM_ENDPOINT: https://api.openai.com/v1
+      LLM_API_KEY: ${{ secrets.OPENAI_API_KEY  }}
       LLM_API_VERSION: "2024-02-01"
-      EMBEDDING_PROVIDER: openai
-      EMBEDDING_MODEL: text-embedding-3-small
-      EMBEDDING_ENDPOINT: https://api.openai.com/v1/
-      EMBEDDING_API_KEY: ${{ secrets.LLM_API_KEY }}
-      EMBEDDING_API_VERSION: "2024-02-01"
+      EMBEDDING_DIMENSIONS: 300
+      EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+      EMBEDDING_ENDPOINT: ${{ secrets.EMBEDDING_ENDPOINT }}
+      EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+      EMBEDDING_API_VERSION: ${{ secrets.EMBEDDING_API_VERSION }}
+
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -125,13 +131,13 @@ jobs:
 
       - name: Test Weighted Edges Example
         run: |
-          poetry run python examples/python/weighted_edges_example.py
+          uv run python examples/demos/dynamic_multiple_weighted_edges_example.py
 
       - name: Verify Visualization File Created
         run: |
-          if [ -f "examples/python/weighted_graph_visualization.html" ]; then
+          if [ -f "examples/demos/.artifacts/dunder_mifflin_company_graph.html" ]; then
             echo "✅ Visualization file created successfully"
-            ls -la examples/python/weighted_graph_visualization.html
+            ls -la examples/demos/.artifacts/dunder_mifflin_company_graph.html
           else
             echo "❌ Visualization file not found"
             exit 1
@@ -144,7 +150,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -154,13 +160,11 @@ jobs:
           python-version: '3.11'
 
       - name: Run Linting on Weighted Edges Files
-        uses: astral-sh/ruff-action@v2
+        uses: astral-sh/ruff-action@v3
         with:
-          args: "check cognee/modules/graph/utils/get_graph_from_model.py cognee/tests/unit/interfaces/graph/test_weighted_edges.py examples/python/weighted_edges_example.py"
+          args: "check cognee/modules/graph/utils/get_graph_from_model.py cognee/tests/unit/interfaces/graph/test_weighted_edges.py examples/demos/dynamic_multiple_weighted_edges_example.py"
 
       - name: Run Formatting Check on Weighted Edges Files
-        uses: astral-sh/ruff-action@v2
+        uses: astral-sh/ruff-action@v3
         with:
-          args: "format --check cognee/modules/graph/utils/get_graph_from_model.py cognee/tests/unit/interfaces/graph/test_weighted_edges.py examples/python/weighted_edges_example.py"
-
- 
+          args: "format --check cognee/modules/graph/utils/get_graph_from_model.py cognee/tests/unit/interfaces/graph/test_weighted_edges.py examples/demos/dynamic_multiple_weighted_edges_example.py"

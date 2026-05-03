@@ -2,13 +2,16 @@
 
 import asyncio
 import json
-from typing import List, Optional, Any, Dict, Type, Tuple
+from collections import Counter
+from typing import List, Optional, Any, Dict, Tuple
 from uuid import UUID
 
-from cognee.exceptions import InvalidValueError
+from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
+from cognee.infrastructure.databases.exceptions import MutuallyExclusiveQueryParametersError
 from cognee.infrastructure.databases.graph.neptune_driver.adapter import NeptuneGraphDB
 from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBInterface
 from cognee.infrastructure.engine import DataPoint
+from cognee.modules.engine.utils.generate_edge_id import generate_edge_id
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.shared.logging_utils import get_logger
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
@@ -25,12 +28,14 @@ class IndexSchema(DataPoint):
     Attributes:
     - id: A string representing the unique identifier for the data point.
     - text: A string representing the content of the data point.
+    - belongs_to_set: A list of node names this data point belongs to, used for filtering.
     - metadata: A dictionary with default index fields for the schema, currently configured
     to include 'text'.
     """
 
     id: str
     text: str
+    belongs_to_set: List[str] = []
     metadata: dict = {"index_fields": ["text"]}
 
 
@@ -233,8 +238,11 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         collection_name: str,
         query_text: Optional[str] = None,
         query_vector: Optional[List[float]] = None,
-        limit: int = None,
+        limit: Optional[int] = None,
         with_vector: bool = False,
+        include_payload: bool = False,  # TODO: Add support for this parameter
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a search in the specified collection using either a text query or a vector
@@ -264,21 +272,19 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
                 "Use this option only when vector data is required."
             )
 
-        # In the case of excessive limit, or zero / negative value, limit will be set to 10.
+        # In the case of excessive limit, or None / zero / negative value, limit will be set to 10.
         if not limit or limit <= self._TOPK_LOWER_BOUND or limit > self._TOPK_UPPER_BOUND:
             logger.warning(
-                "Provided limit (%s) is invalid (zero, negative, or exceeds maximum). "
+                "Provided limit (%s) is invalid (None, zero, negative, or exceeds maximum). "
                 "Defaulting to limit=10.",
                 limit,
             )
             limit = self._TOPK_UPPER_BOUND
 
         if query_vector and query_text:
-            raise InvalidValueError(
-                message="The search function accepts either text or embedding as input, but not both."
-            )
+            raise MutuallyExclusiveQueryParametersError()
         elif query_text is None and query_vector is None:
-            raise InvalidValueError(message="One of query_text or query_vector must be provided!")
+            raise MissingQueryParameterError()
         elif query_vector:
             embedding = query_vector
         else:
@@ -291,16 +297,32 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         query_string = f"""
         CALL neptune.algo.vectors.topKByEmbeddingWithFiltering({{
                 topK: {limit},
-                embedding: {embedding}, 
+                embedding: {embedding},
                 nodeFilter: {{ equals: {{property: '{self._COLLECTION_PREFIX}', value: '{collection_name}'}} }}
               }}
             )
         YIELD node, score
         """
 
+        # Filter by belongs_to_set if node_name is provided
+        if node_name:
+            escaped_names = [name.replace("'", "\\'") for name in node_name]
+            name_list = ", ".join(f"'{name}'" for name in escaped_names)
+
+            if node_name_filter_operator == "OR":
+                query_string += f"""
+                WITH node, score
+                WHERE any(name IN node.belongs_to_set WHERE name IN [{name_list}])
+                """
+            else:
+                query_string += f"""
+                WITH node, score
+                WHERE all(name IN node.belongs_to_set WHERE name IN [{name_list}])
+                """
+
         if with_vector:
             query_string += """
-        WITH node, score, id(node) as node_id 
+        WITH node, score, id(node) as node_id
         MATCH (n)
         WHERE id(n) = id(node)
         CALL neptune.algo.vectors.get(n)
@@ -320,7 +342,14 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             self._na_exception_handler(e, query_string)
 
     async def batch_search(
-        self, collection_name: str, query_texts: List[str], limit: int, with_vectors: bool = False
+        self,
+        collection_name: str,
+        query_texts: List[str],
+        limit: int,
+        with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: Optional[List[str]] = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a batch search using multiple text queries against a collection.
@@ -343,7 +372,16 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         data_vectors = await self.embedding_engine.embed_text(query_texts)
         return await asyncio.gather(
             *[
-                self.search(collection_name, None, vector, limit, with_vectors)
+                self.search(
+                    collection_name,
+                    None,
+                    vector,
+                    limit,
+                    with_vectors,
+                    include_payload=include_payload,
+                    node_name=node_name,
+                    node_name_filter_operator=node_name_filter_operator,
+                )
                 for vector in data_vectors
             ]
         )
@@ -417,6 +455,15 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         self._client.query(f"MATCH (n :{self._VECTOR_NODE_LABEL}) DETACH DELETE n")
         pass
 
+    async def is_empty(self) -> bool:
+        query = """
+        MATCH (n)
+        RETURN true
+        LIMIT 1;
+        """
+        query_result = self._client.query(query)
+        return len(query_result) == 0
+
     @staticmethod
     def _get_scored_result(
         item: dict, with_vector: bool = False, with_score: bool = False
@@ -447,3 +494,90 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             raise ValueError(
                 "Neptune Analytics requires an embedder defined to make vector operations"
             )
+
+    async def add_nodes_with_vectors(self, data_points: List[DataPoint]) -> None:
+        """Add nodes to the graph and index their embeddable fields as vector data points.
+
+        This is the hybrid write path for Neptune Analytics: graph nodes are inserted
+        via ``add_nodes`` and vector embeddings are stored as COGNEE_NODE entries
+        grouped by ``(TypeName, field_name)`` collection.
+
+        Parameters:
+        -----------
+            - data_points (List[DataPoint]): Nodes to insert. Each node's
+              ``metadata["index_fields"]`` controls which fields are embedded.
+        """
+        if not data_points:
+            return
+
+        await self.add_nodes(data_points)
+
+        # Group by (type_name, field_name) to build one collection per field.
+        groups: Dict[Tuple[str, str], List[DataPoint]] = {}
+        for dp in data_points:
+            if not hasattr(dp, "metadata") or not dp.metadata:
+                continue
+            type_name = type(dp).__name__
+            for field_name in dp.metadata.get("index_fields", []):
+                if getattr(dp, field_name, None) is None:
+                    continue
+                key = (type_name, field_name)
+                groups.setdefault(key, []).append(dp)
+
+        for (type_name, field_name), points in groups.items():
+            await self.create_vector_index(type_name, field_name)
+            index_schemas = [
+                IndexSchema(
+                    id=str(dp.id),
+                    text=getattr(dp, field_name),
+                    belongs_to_set=dp.belongs_to_set or [],
+                )
+                for dp in points
+            ]
+            await self.create_data_points(f"{type_name}_{field_name}", index_schemas)
+
+    async def add_edges_with_vectors(
+        self, edges: List[Tuple[str, str, str, Dict[str, Any]]]
+    ) -> None:
+        """Add edges to the graph and index unique relationship types as vector data points.
+
+        Graph edges are inserted via ``add_edges``. Each distinct relationship type
+        (or ``edge_text`` when present in edge properties) is embedded and stored as a
+        COGNEE_NODE in the ``EdgeType_relationship_name`` collection, matching the
+        behaviour of the non-hybrid ``index_graph_edges`` task.
+
+        Parameters:
+        -----------
+            - edges (List[Tuple]): Edges in ``(source_id, target_id, rel_name, props)``
+              format, as produced by ``get_graph_from_model``.
+        """
+        if not edges:
+            return
+
+        await self.add_edges(edges)
+
+        # Collect unique edge texts for embedding.
+        edge_texts = []
+        for edge in edges:
+            props = edge[3] if len(edge) > 3 and edge[3] else {}
+            edge_text = props.get("edge_text", edge[2])
+            edge_texts.append(edge_text)
+
+        edge_type_counts = Counter(edge_texts)
+        if not edge_type_counts:
+            return
+
+        await self.create_vector_index("EdgeType", "relationship_name")
+        index_schemas = [
+            IndexSchema(
+                id=str(generate_edge_id(edge_id=text)),
+                text=text,
+                belongs_to_set=[],
+            )
+            for text in edge_type_counts
+        ]
+        await self.create_data_points("EdgeType_relationship_name", index_schemas)
+
+    async def run_migrations(self):
+        """Run Neptune Analytics adapter migrations (currently no-op)."""
+        return None

@@ -1,7 +1,11 @@
+from typing import Any
+
 import filetype
-from typing import Dict, List, Optional, Any
-from .LoaderInterface import LoaderInterface
+
+from cognee.infrastructure.files.utils.guess_file_type import guess_file_type
 from cognee.shared.logging_utils import get_logger
+
+from .LoaderInterface import LoaderInterface
 
 logger = get_logger(__name__)
 
@@ -14,23 +18,26 @@ class LoaderEngine:
     providing a centralized system for file loading operations.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """
         Initialize the loader engine.
 
         Args:
             default_loader_priority: Priority order for loader selection
         """
-        self._loaders: Dict[str, LoaderInterface] = {}
-        self._extension_map: Dict[str, List[LoaderInterface]] = {}
-        self._mime_type_map: Dict[str, List[LoaderInterface]] = {}
+        self._loaders: dict[str, LoaderInterface] = {}
+        self._extension_map: dict[str, list[LoaderInterface]] = {}
+        self._mime_type_map: dict[str, list[LoaderInterface]] = {}
 
         self.default_loader_priority = [
             "text_loader",
             "pypdf_loader",
             "image_loader",
             "audio_loader",
+            "csv_loader",
             "unstructured_loader",
+            "advanced_pdf_loader",
+            "docling_loader",
         ]
 
     def register_loader(self, loader: LoaderInterface) -> bool:
@@ -63,8 +70,10 @@ class LoaderEngine:
         return True
 
     def get_loader(
-        self, file_path: str, preferred_loaders: List[str] = None
-    ) -> Optional[LoaderInterface]:
+        self,
+        file_path: str,
+        preferred_loaders: dict[str, dict[str, Any]] | None,
+    ) -> LoaderInterface | None:
         """
         Get appropriate loader for a file.
 
@@ -75,43 +84,55 @@ class LoaderEngine:
         Returns:
             LoaderInterface that can handle the file, or None if not found
         """
+        from pathlib import Path
 
-        file_info = filetype.guess(file_path)
+        file_info = guess_file_type(file_path)  # ty:ignore[invalid-argument-type]
+
+        path_extension = Path(file_path).suffix.lstrip(".")
 
         # Try preferred loaders first
         if preferred_loaders:
             for loader_name in preferred_loaders:
                 if loader_name in self._loaders:
                     loader = self._loaders[loader_name]
+                    # Try with path extension first (for text formats like html)
+                    if loader.can_handle(extension=path_extension, mime_type=file_info.mime):
+                        return loader
+                    # Fall back to content-detected extension
                     if loader.can_handle(extension=file_info.extension, mime_type=file_info.mime):
                         return loader
                 else:
-                    raise ValueError(f"Loader does not exist: {loader_name}")
+                    logger.info(f"Skipping {loader_name}: Preferred Loader not registered")
 
         # Try default priority order
         for loader_name in self.default_loader_priority:
             if loader_name in self._loaders:
                 loader = self._loaders[loader_name]
+                # Try with path extension first (for text formats like html)
+                if loader.can_handle(extension=path_extension, mime_type=file_info.mime):
+                    return loader
+                # Fall back to content-detected extension
                 if loader.can_handle(extension=file_info.extension, mime_type=file_info.mime):
                     return loader
             else:
-                raise ValueError(f"Loader does not exist: {loader_name}")
+                logger.info(
+                    f"Skipping {loader_name}: Loader not registered (in default priority list)."
+                )
 
         return None
 
     async def load_file(
         self,
         file_path: str,
-        file_stream: Optional[Any],
-        preferred_loaders: Optional[List[str]] = None,
-        **kwargs,
-    ):
+        preferred_loaders: dict[str, dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> str:
         """
         Load file using appropriate loader.
 
         Args:
             file_path: Path to the file to be processed
-            preferred_loaders: List of preferred loader names to try first
+            preferred_loaders: Dict of loader names to their configurations
             **kwargs: Additional loader-specific configuration
 
         Raises:
@@ -123,10 +144,18 @@ class LoaderEngine:
             raise ValueError(f"No loader found for file: {file_path}")
 
         logger.debug(f"Loading {file_path} with {loader.loader_name}")
-        # TODO: loading needs to be reworked to work with both file streams and file locations
-        return await loader.load(file_path, **kwargs)
 
-    def get_available_loaders(self) -> List[str]:
+        # Extract loader-specific config from preferred_loaders
+        loader_config = {}
+        if preferred_loaders and loader.loader_name in preferred_loaders:
+            loader_config = preferred_loaders[loader.loader_name]
+
+        # Merge with any additional kwargs (kwargs take precedence)
+        merged_kwargs = {**loader_config, **kwargs}
+
+        return await loader.load(file_path, **merged_kwargs)
+
+    def get_available_loaders(self) -> list[str]:
         """
         Get list of available loader names.
 
@@ -135,7 +164,7 @@ class LoaderEngine:
         """
         return list(self._loaders.keys())
 
-    def get_loader_info(self, loader_name: str) -> Dict[str, any]:
+    def get_loader_info(self, loader_name: str) -> dict[str, Any]:
         """
         Get information about a specific loader.
 

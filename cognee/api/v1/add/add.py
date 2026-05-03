@@ -1,28 +1,122 @@
+import inspect
+from tempfile import SpooledTemporaryFile
+from types import SimpleNamespace
 from uuid import UUID
-from typing import Union, BinaryIO, List, Optional
+from typing import Union, BinaryIO, List, Optional, Any
 
-from cognee.modules.pipelines import Task
 from cognee.modules.users.models import User
-from cognee.modules.pipelines import cognee_pipeline
+from cognee.modules.pipelines import Task, run_pipeline
+from cognee.modules.pipelines.layers.resolve_authorized_user_dataset import (
+    resolve_authorized_user_dataset,
+)
+from cognee.modules.pipelines.layers.reset_dataset_pipeline_run_status import (
+    reset_dataset_pipeline_run_status,
+)
+from cognee.modules.pipelines.layers.pipeline_execution_mode import get_pipeline_executor
+from cognee.modules.engine.operations.setup import setup
 from cognee.tasks.ingestion import ingest_data, resolve_data_directories
+from cognee.tasks.ingestion.data_item import DataItem
+from cognee.tasks.ingestion.resolve_dlt_sources import resolve_dlt_sources
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
+
+
+def _normalize_filename(filename: Optional[str], index: int) -> str:
+    if not filename:
+        return f"upload_{index}.bin"
+    normalized = str(filename).replace("\\", "/").split("/")[-1]
+    return normalized or f"upload_{index}.bin"
+
+
+async def _read_stream_bytes(stream: Any) -> bytes:
+    if not hasattr(stream, "read"):
+        raise TypeError(f"Expected stream-like object, got: {type(stream)}")
+
+    # Best effort to read from the start of the stream.
+    if hasattr(stream, "seek"):
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+    data = stream.read()
+    if inspect.isawaitable(data):
+        data = await data
+
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"Unsupported stream payload type: {type(data)}")
+
+    return bytes(data)
+
+
+async def _materialize_stream_for_background(data_item: Any, index: int = 0) -> Any:
+    if isinstance(data_item, DataItem):
+        return DataItem(
+            data=await _materialize_stream_for_background(data_item.data, index=index),
+            label=data_item.label,
+            external_metadata=data_item.external_metadata,
+            data_id=data_item.data_id,
+        )
+
+    if isinstance(data_item, list):
+        return [
+            await _materialize_stream_for_background(item, index=i)
+            for i, item in enumerate(data_item)
+        ]
+
+    # Keep stable primitives untouched.
+    if isinstance(data_item, str):
+        return data_item
+
+    stream = getattr(data_item, "file", data_item if hasattr(data_item, "read") else None)
+    if stream is None:
+        return data_item
+
+    payload = await _read_stream_bytes(stream)
+    buffer = SpooledTemporaryFile(mode="w+b")
+    buffer.write(payload)
+    buffer.seek(0)
+
+    filename = _normalize_filename(
+        getattr(data_item, "filename", None) or getattr(stream, "name", None),
+        index=index,
+    )
+
+    # Ingestion path supports objects exposing `.file` and `.filename`.
+    return SimpleNamespace(file=buffer, filename=filename)
 
 
 async def add(
-    data: Union[BinaryIO, list[BinaryIO], str, list[str]],
+    data: Union[
+        BinaryIO,
+        list[BinaryIO],
+        str,
+        list[str],
+        DataItem,
+        list[DataItem],
+        Any,  # DltResource, SourceFactory, or other dlt types
+    ],
     dataset_name: str = "main_dataset",
     user: User = None,
     node_set: Optional[List[str]] = None,
     vector_db_config: dict = None,
     graph_db_config: dict = None,
     dataset_id: Optional[UUID] = None,
-    preferred_loaders: List[str] = None,
+    preferred_loaders: Optional[List[Union[str, dict[str, dict[str, Any]]]]] = None,
     incremental_loading: bool = True,
+    data_per_batch: Optional[int] = 20,
+    importance_weight: Optional[float] = 0.5,
+    run_in_background: bool = False,
+    **kwargs,
 ):
     """
     Add data to Cognee for knowledge graph processing.
 
     This is the first step in the Cognee workflow - it ingests raw data and prepares it
-    for processing. The function accepts various data formats including text, files, and
+    for processing. The function accepts various data formats including text, files, urls and
     binary streams, then stores them in a specified dataset for further processing.
 
     Prerequisites:
@@ -62,6 +156,7 @@ async def add(
             - S3 path: "s3://my-bucket/documents/file.pdf"
             - List of mixed types: ["text content", "/path/file.pdf", "file://doc.txt", file_handle]
             - Binary file object: open("file.txt", "rb")
+            - url: A web link url (https or http)
         dataset_name: Name of the dataset to store data in. Defaults to "main_dataset".
                     Create separate datasets to organize different knowledge domains.
         user: User object for authentication and permissions. Uses default user if None.
@@ -72,6 +167,11 @@ async def add(
         vector_db_config: Optional configuration for vector database (for custom setups).
         graph_db_config: Optional configuration for graph database (for custom setups).
         dataset_id: Optional specific dataset UUID to use instead of dataset_name.
+        run_in_background: If True, starts ingestion asynchronously and returns immediately.
+                          If False (default), waits for completion before returning.
+        extraction_rules: Optional dictionary of rules (e.g., CSS selectors, XPath) for extracting specific content from web pages using BeautifulSoup
+        tavily_config: Optional configuration for Tavily API, including API key and extraction settings
+        soup_crawler_config: Optional configuration for BeautifulSoup crawler, specifying concurrency, crawl delay, and extraction rules.
 
     Returns:
         PipelineRunInfo: Information about the ingestion pipeline execution including:
@@ -120,6 +220,21 @@ async def add(
 
         # Add a single file
         await cognee.add("/home/user/documents/analysis.pdf")
+
+        # Add a single url and bs4 extract ingestion method
+        extraction_rules = {
+            "title": "h1",
+            "description": "p",
+            "more_info": "a[href*='more-info']"
+        }
+        await cognee.add("https://example.com",extraction_rules=extraction_rules)
+
+        # Add a single url and tavily extract ingestion method
+        Make sure to set TAVILY_API_KEY = YOUR_TAVILY_API_KEY as a environment variable
+        await cognee.add("https://example.com")
+
+        # Add multiple urls
+        await cognee.add(["https://example.com","https://books.toscrape.com"])
         ```
 
     Environment Variables:
@@ -127,36 +242,91 @@ async def add(
         - LLM_API_KEY: API key for your LLM provider (OpenAI, Anthropic, etc.)
 
         Optional:
-        - LLM_PROVIDER: "openai" (default), "anthropic", "gemini", "ollama"
-        - LLM_MODEL: Model name (default: "gpt-4o-mini")
+        - LLM_PROVIDER: "openai" (default), "anthropic", "gemini", "ollama", "mistral", "bedrock"
+        - LLM_MODEL: Model name (default: "gpt-5-mini")
         - DEFAULT_USER_EMAIL: Custom default user email
         - DEFAULT_USER_PASSWORD: Custom default user password
         - VECTOR_DB_PROVIDER: "lancedb" (default), "chromadb", "pgvector"
-        - GRAPH_DATABASE_PROVIDER: "kuzu" (default), "neo4j", "networkx"
+        - GRAPH_DATABASE_PROVIDER: "ladybug" (default), "neo4j"
+        - TAVILY_API_KEY: YOUR_TAVILY_API_KEY
 
-    Raises:
-        FileNotFoundError: If specified file paths don't exist
-        PermissionError: If user lacks access to files or dataset
-        UnsupportedFileTypeError: If file format cannot be processed
-        InvalidValueError: If LLM_API_KEY is not set or invalid
     """
+    # Route to remote instance if connected via serve()
+    from cognee.api.v1.serve.state import get_remote_client
+
+    client = get_remote_client()
+    if client is not None:
+        result = await client.add(data, dataset_name)
+        # Wrap in a simple namespace so callers expecting .model_dump() still work
+        from types import SimpleNamespace
+
+        return SimpleNamespace(**result)
+
+    if preferred_loaders is not None:
+        transformed = {}
+        for item in preferred_loaders:
+            if isinstance(item, dict):
+                transformed.update(item)
+            else:
+                transformed[item] = {}
+        preferred_loaders = transformed
+
     tasks = [
         Task(resolve_data_directories, include_subdirectories=True),
-        Task(ingest_data, dataset_name, user, node_set, dataset_id, preferred_loaders),
+        Task(
+            ingest_data,
+            dataset_name,
+            user,
+            node_set,
+            dataset_id,
+            preferred_loaders,
+            importance_weight,
+        ),
     ]
 
-    pipeline_run_info = None
+    await setup()
 
-    async for run_info in cognee_pipeline(
+    user, authorized_dataset = await resolve_authorized_user_dataset(
+        dataset_name=dataset_name, dataset_id=dataset_id, user=user
+    )
+
+    # Expand DLT resources (and auto-detected CSV/connection strings) into
+    # standard DataItems before the pipeline sees them.
+    data = await resolve_dlt_sources(
+        data,
+        dataset_name=dataset_name,
+        user=user,
+        **kwargs,
+    )
+
+    # Background runs must not depend on caller/request-scoped stream lifetimes.
+    # Materialize stream-like inputs into owned in-memory buffers up front.
+    if run_in_background:
+        data = await _materialize_stream_for_background(data)
+
+    await reset_dataset_pipeline_run_status(
+        authorized_dataset.id, user, pipeline_names=["add_pipeline", "cognify_pipeline"]
+    )
+
+    pipeline_executor_func = get_pipeline_executor(run_in_background=run_in_background)
+
+    result = await pipeline_executor_func(
+        pipeline=run_pipeline,
         tasks=tasks,
-        datasets=dataset_id if dataset_id else dataset_name,
+        datasets=[authorized_dataset.id],
         data=data,
         user=user,
         pipeline_name="add_pipeline",
         vector_db_config=vector_db_config,
         graph_db_config=graph_db_config,
+        use_pipeline_cache=True,
         incremental_loading=incremental_loading,
-    ):
-        pipeline_run_info = run_info
+        data_per_batch=data_per_batch,
+    )
 
-    return pipeline_run_info
+    # run_pipeline_blocking returns {dataset_id: PipelineRunInfo} but callers
+    # expect a single PipelineRunInfo (add always processes one dataset).
+    if isinstance(result, dict) and len(result) == 1:
+        return next(iter(result.values()))
+
+    return result

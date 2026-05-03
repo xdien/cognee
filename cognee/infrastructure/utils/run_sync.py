@@ -1,15 +1,31 @@
 import asyncio
 import threading
+from collections.abc import Coroutine
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 
-def run_sync(coro, timeout=None):
+def run_sync(
+    coro: Coroutine[Any, Any, T],
+    running_loop: asyncio.AbstractEventLoop | None = None,
+    timeout: float | None = None,
+) -> T | None:
     result = None
     exception = None
 
-    def runner():
-        nonlocal result, exception
+    def runner() -> None:
+        nonlocal result, exception, running_loop
+
         try:
-            result = asyncio.run(coro)
+            try:
+                if not running_loop:
+                    running_loop = asyncio.get_running_loop()
+
+                result = asyncio.run_coroutine_threadsafe(coro, running_loop).result(timeout)
+            except RuntimeError:
+                result = asyncio.run(coro)
+
         except Exception as e:
             exception = e
 

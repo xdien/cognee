@@ -1,25 +1,65 @@
 from uuid import UUID
 from typing import Union, Optional, List, Type
 
+from cognee.modules.engine.models.node_set import NodeSet
 from cognee.modules.users.models import User
-from cognee.modules.search.types import SearchType
+from cognee.modules.search.types import SearchResult, SearchType
 from cognee.modules.users.methods import get_default_user
 from cognee.modules.search.methods import search as search_function
 from cognee.modules.data.methods import get_authorized_existing_datasets
 from cognee.modules.data.exceptions import DatasetNotFoundError
+from cognee.context_global_variables import set_session_user_context_variable
+from cognee.shared.logging_utils import get_logger
+from cognee.infrastructure.databases.exceptions import DatabaseNotCreatedError
+from cognee.exceptions import CogneeValidationError
+from cognee.modules.users.exceptions.exceptions import UserNotFoundError
+from cognee.modules.observability import (
+    new_span,
+    COGNEE_SEARCH_QUERY,
+    COGNEE_SEARCH_TYPE,
+    COGNEE_RESULT_SUMMARY,
+    COGNEE_RESULT_COUNT,
+)
+
+logger = get_logger()
 
 
 async def search(
     query_text: str,
     query_type: SearchType = SearchType.GRAPH_COMPLETION,
-    user: User = None,
+    user: Optional[User] = None,
     datasets: Optional[Union[list[str], str]] = None,
     dataset_ids: Optional[Union[list[UUID], UUID]] = None,
     system_prompt_path: str = "answer_simple_question.txt",
+    system_prompt: Optional[str] = None,
     top_k: int = 10,
-    node_type: Optional[Type] = None,
+    node_type: Optional[Type] = NodeSet,
     node_name: Optional[List[str]] = None,
-) -> list:
+    node_name_filter_operator: str = "OR",
+    only_context: bool = False,
+    session_id: Optional[str] = None,
+    wide_search_top_k: Optional[int] = 100,
+    triplet_distance_penalty: Optional[float] = 6.5,
+    feedback_influence: float = 0.0,
+    verbose: bool = False,
+    retriever_specific_config: Optional[dict] = None,
+    neighborhood_depth: Optional[int] = None,
+    neighborhood_seed_top_k: Optional[int] = None,
+) -> List[SearchResult]:
+    if neighborhood_depth is not None and (
+        not isinstance(neighborhood_depth, int) or neighborhood_depth < 1
+    ):
+        raise CogneeValidationError(
+            message="neighborhood_depth must be a positive integer.",
+            name="InvalidNeighborhoodDepth",
+        )
+    if neighborhood_seed_top_k is not None and (
+        not isinstance(neighborhood_seed_top_k, int) or neighborhood_seed_top_k < 1
+    ):
+        raise CogneeValidationError(
+            message="neighborhood_seed_top_k must be a positive integer.",
+            name="InvalidNeighborhoodSeedTopK",
+        )
     """
     Search and query the knowledge graph for insights, information, and connections.
 
@@ -46,11 +86,6 @@ async def search(
             Best for: Direct document retrieval, specific fact-finding.
             Returns: LLM responses based on relevant text chunks.
 
-        **INSIGHTS**:
-            Structured entity relationships and semantic connections.
-            Best for: Understanding concept relationships, knowledge mapping.
-            Returns: Formatted relationship data and entity connections.
-
         **CHUNKS**:
             Raw text segments that match the query semantically.
             Best for: Finding specific passages, citations, exact content.
@@ -76,6 +111,9 @@ async def search(
             Best for: General-purpose queries or when you're unsure which search type is best.
             Returns: The results from the automatically selected search type.
 
+        **CHUNKS_LEXICAL**:
+            Token-based lexical chunk search (e.g., Jaccard). Best for: exact-term matching, stopword-aware lookups.
+            Returns: Ranked text chunks (optionally with scores).
 
     Args:
         query_text: Your question or search query in natural language.
@@ -107,14 +145,20 @@ async def search(
 
         node_name: Filter results to specific named entities (for targeted search).
 
+        node_name_filter_operator: Operator determining how to filter based on node names.
+                                    Possible values: AND, OR (default is OR, i.e. disjunction)
+
+        session_id: Optional session identifier for caching Q&A interactions. Defaults to 'default_session' if None.
+
+        verbose: If True, returns detailed result information including graph representation (when possible).
+
+        retriever_specific_config: Optional dictionary of additional configuration parameters specific to the retriever being used.
+
     Returns:
         list: Search results in format determined by query_type:
 
             **GRAPH_COMPLETION/RAG_COMPLETION**:
                 [List of conversational AI response strings]
-
-            **INSIGHTS**:
-                [List of formatted relationship descriptions and entity connections]
 
             **CHUNKS**:
                 [List of relevant text passages with source metadata]
@@ -135,7 +179,6 @@ async def search(
     Performance & Optimization:
         - **GRAPH_COMPLETION**: Slower but most intelligent, uses LLM + graph context
         - **RAG_COMPLETION**: Medium speed, uses LLM + document chunks (no graph traversal)
-        - **INSIGHTS**: Fast, returns structured relationships without LLM processing
         - **CHUNKS**: Fastest, pure vector similarity search without LLM
         - **SUMMARIES**: Fast, returns pre-computed summaries
         - **CODE**: Medium speed, specialized for code understanding
@@ -158,37 +201,81 @@ async def search(
         - VECTOR_DB_PROVIDER: Must match what was used during cognify
         - GRAPH_DATABASE_PROVIDER: Must match what was used during cognify
 
-    Raises:
-        DatasetNotFoundError: If specified datasets don't exist or aren't accessible
-        PermissionDeniedError: If user lacks read access to requested datasets
-        NoDataError: If no relevant data found for the search query
-        InvalidValueError: If LLM_API_KEY is not set (for LLM-based search types)
-        ValueError: If query_text is empty or search parameters are invalid
-        CollectionNotFoundError: If vector collection not found (data not processed)
     """
-    # We use lists from now on for datasets
-    if isinstance(datasets, UUID) or isinstance(datasets, str):
-        datasets = [datasets]
+    # Route to remote instance if connected via serve()
+    from cognee.api.v1.serve.state import get_remote_client
 
-    if user is None:
-        user = await get_default_user()
+    client = get_remote_client()
+    if client is not None:
+        return await client.search(query_text, search_type=query_type, datasets=datasets)
 
-    # Transform string based datasets to UUID - String based datasets can only be found for current user
-    if datasets is not None and [all(isinstance(dataset, str) for dataset in datasets)]:
-        datasets = await get_authorized_existing_datasets(datasets, "read", user)
-        datasets = [dataset.id for dataset in datasets]
-        if not datasets:
-            raise DatasetNotFoundError(message="No datasets found.")
+    with new_span("cognee.api.search") as span:
+        span.set_attribute(COGNEE_SEARCH_QUERY, query_text[:500])
+        span.set_attribute(COGNEE_SEARCH_TYPE, str(query_type.value))
+        span.set_attribute("cognee.search.top_k", top_k)
 
-    filtered_search_results = await search_function(
-        query_text=query_text,
-        query_type=query_type,
-        dataset_ids=dataset_ids if dataset_ids else datasets,
-        user=user,
-        system_prompt_path=system_prompt_path,
-        top_k=top_k,
-        node_type=node_type,
-        node_name=node_name,
-    )
+        # We use lists from now on for datasets
+        if isinstance(datasets, UUID) or isinstance(datasets, str):
+            datasets = [datasets]
 
-    return filtered_search_results
+        allowed_node_name_operators = {"AND", "OR"}
+        normalized_node_name_filter_operator = (node_name_filter_operator or "").strip().upper()
+
+        if normalized_node_name_filter_operator not in allowed_node_name_operators:
+            raise CogneeValidationError(
+                f"Invalid node_name_filter_operator: {node_name_filter_operator!r}. Must be one of {sorted(allowed_node_name_operators)}."
+            )
+
+        if user is None:
+            try:
+                user = await get_default_user()
+            except (DatabaseNotCreatedError, UserNotFoundError) as error:
+                # Provide a clear, actionable message instead of surfacing low-level stacktraces
+                raise CogneeValidationError(
+                    message=(
+                        "Search prerequisites not met: no database/default user found. "
+                        "Initialize Cognee before searching by:\n"
+                        "• running `await cognee.add(...)` followed by `await cognee.cognify()`."
+                    ),
+                    name="SearchPreconditionError",
+                ) from error
+
+        await set_session_user_context_variable(user)
+
+        # Transform string based datasets to UUID - String based datasets can only be found for current user
+        if datasets is not None and [all(isinstance(dataset, str) for dataset in datasets)]:
+            datasets = await get_authorized_existing_datasets(datasets, "read", user)
+            datasets = [dataset.id for dataset in datasets]
+            if not datasets:
+                raise DatasetNotFoundError(message="No datasets found.")
+
+        filtered_search_results = await search_function(
+            query_text=query_text,
+            query_type=query_type,
+            dataset_ids=dataset_ids if dataset_ids else datasets,
+            user=user,
+            system_prompt_path=system_prompt_path,
+            system_prompt=system_prompt,
+            top_k=top_k,
+            node_type=node_type,
+            node_name=node_name,
+            node_name_filter_operator=normalized_node_name_filter_operator,
+            only_context=only_context,
+            session_id=session_id,
+            wide_search_top_k=wide_search_top_k,
+            triplet_distance_penalty=triplet_distance_penalty,
+            feedback_influence=feedback_influence,
+            verbose=verbose,
+            retriever_specific_config=retriever_specific_config,
+            neighborhood_depth=neighborhood_depth,
+            neighborhood_seed_top_k=neighborhood_seed_top_k,
+        )
+
+        n = len(filtered_search_results) if filtered_search_results else 0
+        span.set_attribute(COGNEE_RESULT_COUNT, n)
+        span.set_attribute(
+            COGNEE_RESULT_SUMMARY,
+            f"Found {n} result(s) via {query_type.value}",
+        )
+
+        return filtered_search_results

@@ -1,17 +1,30 @@
 import base64
+import logging
+from typing import Any
+
 import instructor
-from typing import Type
+import litellm
 from openai import OpenAI
 from pydantic import BaseModel
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_not_exception_type,
+    stop_after_delay,
+    wait_exponential_jitter,
+)
 
+from cognee.infrastructure.files.utils.open_data_file import open_data_file
 from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.llm_interface import (
     LLMInterface,
 )
-from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.rate_limiter import (
-    rate_limit_async,
-    sleep_and_retry_async,
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.types import (
+    TranscriptionReturnType,
 )
-from cognee.infrastructure.files.utils.open_data_file import open_data_file
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.rate_limiting import llm_rate_limiter_context_manager
+
+logger = get_logger()
 
 
 class OllamaAPIAdapter(LLMInterface):
@@ -30,25 +43,47 @@ class OllamaAPIAdapter(LLMInterface):
     - model
     - api_key
     - endpoint
-    - max_tokens
+    - max_completion_tokens
     - aclient
     """
 
-    def __init__(self, endpoint: str, api_key: str, model: str, name: str, max_tokens: int):
+    default_instructor_mode = "json_mode"
+
+    def __init__(
+        self,
+        endpoint: str,
+        api_key: str,
+        model: str,
+        name: str,
+        max_completion_tokens: int,
+        instructor_mode: str | None = None,
+        llm_args: dict[str, Any] | None = None,
+    ) -> None:
         self.name = name
         self.model = model
         self.api_key = api_key
         self.endpoint = endpoint
-        self.max_tokens = max_tokens
+        self.max_completion_tokens = max_completion_tokens
+        self.llm_args: dict[str, Any] = llm_args or {}
+
+        self.instructor_mode = instructor_mode if instructor_mode else self.default_instructor_mode
 
         self.aclient = instructor.from_openai(
-            OpenAI(base_url=self.endpoint, api_key=self.api_key), mode=instructor.Mode.JSON
+            OpenAI(base_url=self.endpoint, api_key=self.api_key),
+            mode=instructor.Mode(self.instructor_mode),
         )
 
-    @sleep_and_retry_async()
-    @rate_limit_async
+    @retry(
+        stop=stop_after_delay(128),
+        wait=wait_exponential_jitter(8, 128),
+        retry=retry_if_not_exception_type(
+            (litellm.exceptions.NotFoundError, litellm.exceptions.AuthenticationError)
+        ),
+        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        reraise=True,
+    )
     async def acreate_structured_output(
-        self, text_input: str, system_prompt: str, response_model: Type[BaseModel]
+        self, text_input: str, system_prompt: str, response_model: type[BaseModel], **kwargs
     ) -> BaseModel:
         """
         Generate a structured output from the LLM using the provided text and system prompt.
@@ -69,27 +104,37 @@ class OllamaAPIAdapter(LLMInterface):
 
             - BaseModel: A structured output that conforms to the specified response model.
         """
-
-        response = self.aclient.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"{text_input}",
-                },
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-            ],
-            max_retries=5,
-            response_model=response_model,
-        )
+        merged_kwargs = {**self.llm_args, **kwargs}
+        async with llm_rate_limiter_context_manager():
+            response = self.aclient.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": f"{text_input}",
+                    },
+                ],
+                max_retries=2,
+                response_model=response_model,
+                **merged_kwargs,
+            )
 
         return response
 
-    @rate_limit_async
-    async def create_transcript(self, input_file: str) -> str:
+    @retry(
+        stop=stop_after_delay(128),
+        wait=wait_exponential_jitter(8, 128),
+        retry=retry_if_not_exception_type(
+            (litellm.exceptions.NotFoundError, litellm.exceptions.AuthenticationError)
+        ),
+        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        reraise=True,
+    )
+    async def create_transcript(self, input: str, **kwargs: Any) -> TranscriptionReturnType:
         """
         Generate an audio transcript from a user query.
 
@@ -100,7 +145,7 @@ class OllamaAPIAdapter(LLMInterface):
         Parameters:
         -----------
 
-            - input_file (str): The path to the audio file to be transcribed.
+            - input (str): The path to the audio file to be transcribed.
 
         Returns:
         --------
@@ -108,7 +153,7 @@ class OllamaAPIAdapter(LLMInterface):
             - str: The transcription of the audio as a string.
         """
 
-        async with open_data_file(input_file, mode="rb") as audio_file:
+        async with open_data_file(input, mode="rb") as audio_file:
             transcription = self.aclient.audio.transcriptions.create(
                 model="whisper-1",  # Ensure the correct model for transcription
                 file=audio_file,
@@ -119,10 +164,18 @@ class OllamaAPIAdapter(LLMInterface):
         if not hasattr(transcription, "text"):
             raise ValueError("Transcription failed. No text returned.")
 
-        return transcription.text
+        return TranscriptionReturnType(transcription.text, transcription)
 
-    @rate_limit_async
-    async def transcribe_image(self, input_file: str) -> str:
+    @retry(
+        stop=stop_after_delay(128),
+        wait=wait_exponential_jitter(2, 128),
+        retry=retry_if_not_exception_type(
+            (litellm.exceptions.NotFoundError, litellm.exceptions.AuthenticationError)
+        ),
+        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        reraise=True,
+    )
+    async def transcribe_image(self, input: str, **kwargs: Any) -> str:
         """
         Transcribe content from an image using base64 encoding.
 
@@ -134,7 +187,7 @@ class OllamaAPIAdapter(LLMInterface):
         Parameters:
         -----------
 
-            - input_file (str): The path to the image file to be transcribed.
+            - input (str): The path to the image file to be transcribed.
 
         Returns:
         --------
@@ -142,7 +195,7 @@ class OllamaAPIAdapter(LLMInterface):
             - str: The transcription of the image's content as a string.
         """
 
-        async with open_data_file(input_file, mode="rb") as image_file:
+        async with open_data_file(input, mode="rb") as image_file:
             encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
 
         response = self.aclient.chat.completions.create(
@@ -159,8 +212,8 @@ class OllamaAPIAdapter(LLMInterface):
                     ],
                 }
             ],
-            max_tokens=300,
-        )
+            max_completion_tokens=300,
+        )  # ty:ignore[no-matching-overload]
 
         # Ensure response is valid before accessing .choices[0].message.content
         if not hasattr(response, "choices") or not response.choices:

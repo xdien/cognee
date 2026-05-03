@@ -1,7 +1,8 @@
 import { v4 } from "uuid";
 import { useCallback, useState } from "react";
-import { fetch, useBoolean } from "@/utils";
+import { useBoolean } from "@/utils";
 import { Dataset } from "@/modules/ingestion/useDatasets";
+import { CogneeInstance } from "@/modules/instances/types";
 
 interface ChatMessage {
   id: string;
@@ -9,13 +10,13 @@ interface ChatMessage {
   text: string;
 }
 
-const fetchMessages = () => {
-  return fetch("/v1/search/")
+const fetchMessages = (instance: CogneeInstance) => {
+  return instance.fetch("/v1/search/")
     .then(response => response.json());
 };
 
-const sendMessage = (message: string, searchType: string) => {
-  return fetch("/v1/search/", {
+const sendMessage = (message: string, searchType: string, topK: number, instance: CogneeInstance) => {
+  return instance.fetch("/v1/search/", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -24,14 +25,13 @@ const sendMessage = (message: string, searchType: string) => {
       query: message,
       searchType,
       datasets: ["main_dataset"],
+      top_k: topK,
     }),
   })
     .then(response => response.json());
 };
 
-// Will be used in the future.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-export default function useChat(dataset: Dataset) {
+export default function useChat(dataset: Dataset, instance: CogneeInstance) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
   const {
@@ -39,13 +39,13 @@ export default function useChat(dataset: Dataset) {
     setTrue: disableSearchRun,
     setFalse: enableSearchRun,
   } = useBoolean(false);
-  
-  const refreshChat = useCallback(async () => {
-    const data = await fetchMessages();
-    return setMessages(data);
-  }, []);
 
-  const handleMessageSending = useCallback((message: string, searchType: string) => {
+  const refreshChat = useCallback(async () => {
+    const data = await fetchMessages(instance);
+    return setMessages(data);
+  }, [instance]);
+
+  const handleMessageSending = useCallback((message: string, searchType: string, topK: number) => {
     const sentMessageId = v4();
 
     setMessages((messages) => [
@@ -59,7 +59,7 @@ export default function useChat(dataset: Dataset) {
 
     disableSearchRun();
 
-    return sendMessage(message, searchType)
+    return sendMessage(message, searchType, topK, instance)
       .then(newMessages => {
         setMessages((messages) => [
           ...messages,
@@ -77,7 +77,7 @@ export default function useChat(dataset: Dataset) {
         throw new Error("Failed to send message. Please try again. If the issue persists, please contact support.")
       })
       .finally(() => enableSearchRun());
-  }, [disableSearchRun, enableSearchRun]);
+  }, [disableSearchRun, enableSearchRun, instance]);
 
   return {
     messages,

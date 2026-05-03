@@ -1,15 +1,22 @@
 "use client";
 
+import dynamic from "next/dynamic";
+import classNames from "classnames";
 import { MutableRefObject, useEffect, useImperativeHandle, useRef, useState, useCallback } from "react";
-import { forceCollide, forceManyBody } from "d3-force-3d";
-import ForceGraph, { ForceGraphMethods, GraphData, LinkObject, NodeObject } from "react-force-graph-2d";
+import { ForceGraphMethods, GraphData, LinkObject, NodeObject } from "react-force-graph-2d";
 import { GraphControlsAPI } from "./GraphControls";
 import getColorForNodeType from "./getColorForNodeType";
+
+
+const ForceGraph = dynamic(() => import("react-force-graph-2d"), {
+  ssr: false, // disables SSR (important if the lib touches `window`)
+});
 
 interface GraphVisuzaliationProps {
   ref: MutableRefObject<GraphVisualizationAPI>;
   data?: GraphData<NodeObject, LinkObject>;
   graphControls: MutableRefObject<GraphControlsAPI>;
+  className?: string;
 }
 
 export interface GraphVisualizationAPI {
@@ -17,7 +24,7 @@ export interface GraphVisualizationAPI {
   setGraphShape: (shape: string) => void;
 }
 
-export default function GraphVisualization({ ref, data, graphControls }: GraphVisuzaliationProps) {
+export default function GraphVisualization({ ref, data, graphControls, className }: GraphVisuzaliationProps) {
   const textSize = 6;
   const nodeSize = 15;
   // const addNodeDistanceFromSourceNode = 15;
@@ -47,7 +54,7 @@ export default function GraphVisualization({ ref, data, graphControls }: GraphVi
     // Initial size calculation
     handleResize();
 
-    // ResizeObserver 
+    // ResizeObserver
     const resizeObserver = new ResizeObserver(() => {
       handleResize();
     });
@@ -195,25 +202,32 @@ export default function GraphVisualization({ ref, data, graphControls }: GraphVi
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   function handleDagError(loopNodeIds: (string | number)[]) {}
 
+  // @ts-expect-error nothing to define
   const graphRef = useRef<ForceGraphMethods>();
 
   useEffect(() => {
-    if (typeof window !== "undefined" && data && graphRef.current) {
-      // add collision force
-      graphRef.current.d3Force("collision", forceCollide(nodeSize * 1.5));
-      graphRef.current.d3Force("charge", forceManyBody().strength(-1500).distanceMin(300).distanceMax(900));
+    async function startAnimation() {
+      // @ts-expect-error d3-force-3d has no types
+      const { forceCollide, forceManyBody } = await import("d3-force-3d");
+
+      if (typeof window !== "undefined" && data && graphRef.current) {
+        // add collision force
+        graphRef.current.d3Force("collision", forceCollide(nodeSize * 1.5));
+        graphRef.current.d3Force("charge", forceManyBody().strength(-10).distanceMin(10).distanceMax(50));
+      }
     }
+    startAnimation();
   }, [data, graphRef]);
 
   const [graphShape, setGraphShape] = useState<string>();
-  
+
   useImperativeHandle(ref, () => ({
-    zoomToFit: graphRef.current!.zoomToFit,
+    zoomToFit: graphRef.current?.zoomToFit,
     setGraphShape: setGraphShape,
   }));
 
   return (
-    <div ref={containerRef} className="w-full h-full" id="graph-container">
+    <div ref={containerRef} className={classNames("w-full h-full", className)} id="graph-container">
       {(data && typeof window !== "undefined") ? (
         <ForceGraph
           ref={graphRef}

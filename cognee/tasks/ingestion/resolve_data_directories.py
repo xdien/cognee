@@ -1,6 +1,9 @@
 import os
 from urllib.parse import urlparse
 from typing import List, Union, BinaryIO
+
+from cognee.tasks.ingestion.exceptions import S3FileSystemNotFoundError
+from cognee.exceptions import CogneeSystemError
 from cognee.infrastructure.files.storage.s3_config import get_s3_config
 
 
@@ -29,7 +32,10 @@ async def resolve_data_directories(
         import s3fs
 
         fs = s3fs.S3FileSystem(
-            key=s3_config.aws_access_key_id, secret=s3_config.aws_secret_access_key, anon=False
+            key=s3_config.aws_access_key_id,
+            secret=s3_config.aws_secret_access_key,
+            token=s3_config.aws_session_token,
+            anon=False,
         )
 
     for item in data:
@@ -54,6 +60,8 @@ async def resolve_data_directories(
                             else:
                                 s3_files.append(key)
                     resolved_data.extend(s3_files)
+                else:
+                    raise S3FileSystemNotFoundError()
 
             elif os.path.isdir(item):  # If it's a directory
                 if include_subdirectories:

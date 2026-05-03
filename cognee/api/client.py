@@ -3,28 +3,38 @@
 import os
 
 import uvicorn
-import sentry_sdk
 from traceback import format_exc
 from contextlib import asynccontextmanager
 from fastapi import Request
 from fastapi import FastAPI, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 
 from cognee.exceptions import CogneeApiError
 from cognee.shared.logging_utils import get_logger, setup_logging
-from cognee.api.health import health_checker, HealthStatus
+from cognee.api.v1.cloud.routers import get_checks_router
+from cognee.api.v1.notebooks.routers import get_notebooks_router
 from cognee.api.v1.permissions.routers import get_permissions_router
 from cognee.api.v1.settings.routers import get_settings_router
 from cognee.api.v1.datasets.routers import get_datasets_router
-from cognee.api.v1.cognify.routers import get_code_pipeline_router, get_cognify_router
+from cognee.api.v1.cognify.routers import get_cognify_router
 from cognee.api.v1.search.routers import get_search_router
+from cognee.api.v1.ontologies.routers.get_ontology_router import get_ontology_router
+from cognee.api.v1.memify.routers import get_memify_router
 from cognee.api.v1.add.routers import get_add_router
 from cognee.api.v1.delete.routers import get_delete_router
+from cognee.api.v1.remember.routers import get_remember_router
+from cognee.api.v1.recall.routers import get_recall_router
+from cognee.api.v1.improve.routers import get_improve_router
+from cognee.api.v1.forget.routers import get_forget_router
 from cognee.api.v1.responses.routers import get_responses_router
+from cognee.api.v1.llm.routers import get_llm_router
+from cognee.api.v1.sync.routers import get_sync_router
+from cognee.api.v1.health.routers import get_health_router
+from cognee.api.v1.update.routers import get_update_router
 from cognee.api.v1.users.routers import (
     get_auth_router,
     get_register_router,
@@ -32,16 +42,31 @@ from cognee.api.v1.users.routers import (
     get_verify_router,
     get_users_router,
     get_visualize_router,
+    get_configuration_router,
+    get_user_id_by_email_router,
 )
+from cognee.api.v1.api_keys.routers import get_api_key_management_router
+from cognee.api.v1.activity.routers import get_activity_router
+from cognee.api.v1.sessions import get_sessions_router
+from cognee.modules.users.methods.get_authenticated_user import REQUIRE_AUTHENTICATION
 
+# Ensure application logging is configured for container stdout/stderr
+setup_logging()
 logger = get_logger()
 
 if os.getenv("ENV", "prod") == "prod":
-    sentry_sdk.init(
-        dsn=os.getenv("SENTRY_REPORTING_URL"),
-        traces_sample_rate=1.0,
-        profiles_sample_rate=1.0,
-    )
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=os.getenv("SENTRY_REPORTING_URL"),
+            traces_sample_rate=1.0,
+            profiles_sample_rate=1.0,
+        )
+    except ImportError:
+        logger.info(
+            "Sentry SDK not available. Install with 'pip install cognee\"[monitoring]\"' to enable error monitoring."
+        )
 
 
 app_environment = os.getenv("ENV", "prod")
@@ -54,13 +79,22 @@ async def lifespan(app: FastAPI):
     # await prune_system(metadata = True)
     # if app_environment == "local" or app_environment == "dev":
     from cognee.infrastructure.databases.relational import get_relational_engine
+    from cognee.run_migrations import run_startup_migrations
 
-    db_engine = get_relational_engine()
-    await db_engine.create_database()
+    try:
+        await run_startup_migrations()
+    except Exception:
+        db_engine = get_relational_engine()
+        await db_engine.create_database()
+
+        await run_startup_migrations()
 
     from cognee.modules.users.methods import get_default_user
 
     await get_default_user()
+
+    # Emit a clear startup message for docker logs
+    logger.info("Backend server has started")
 
     yield
 
@@ -76,14 +110,14 @@ if CORS_ALLOWED_ORIGINS:
     ]
 else:
     allowed_origins = [
-        "http://localhost:3000",
+        os.getenv("UI_APP_URL", "http://localhost:3000"),
     ]  # Block all except explicitly set origins
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,  # Now controlled by env var
     allow_credentials=True,
-    allow_methods=["OPTIONS", "GET", "POST", "DELETE"],
+    allow_methods=["OPTIONS", "GET", "PUT", "POST", "DELETE"],
     allow_headers=["*"],
 )
 # To allow origins, set CORS_ALLOWED_ORIGINS env variable to a comma-separated list, e.g.:
@@ -101,16 +135,25 @@ def custom_openapi():
         routes=app.routes,
     )
 
+    # Define security schemes with valid identifiers (no hyphens)
     openapi_schema["components"]["securitySchemes"] = {
+        "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-Api-Key"},
         "BearerAuth": {"type": "http", "scheme": "bearer"},
-        "CookieAuth": {
-            "type": "apiKey",
-            "in": "cookie",
-            "name": os.getenv("AUTH_TOKEN_COOKIE_NAME", "auth_token"),
-        },
     }
 
-    openapi_schema["security"] = [{"BearerAuth": []}, {"CookieAuth": []}]
+    our_security = [{"BearerAuth": []}, {"ApiKeyAuth": []}]
+
+    if REQUIRE_AUTHENTICATION:
+        # Set global security fallback
+        openapi_schema["security"] = our_security
+
+        # Replace per-operation security refs auto-generated by fastapi-users
+        # (they reference internal names like OAuth2PasswordBearer, APIKeyHeader, APIKeyCookie
+        # which no longer exist after we replaced securitySchemes above)
+        for path_data in openapi_schema.get("paths", {}).values():
+            for operation in path_data.values():
+                if isinstance(operation, dict) and "security" in operation:
+                    operation["security"] = our_security
 
     app.openapi_schema = openapi_schema
 
@@ -153,59 +196,6 @@ async def exception_handler(_: Request, exc: CogneeApiError) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail["message"]})
 
 
-@app.get("/")
-async def root():
-    """
-    Root endpoint that returns a welcome message.
-    """
-    return {"message": "Hello, World, I am alive!"}
-
-
-@app.get("/health")
-async def health_check():
-    """
-    Health check endpoint for liveness/readiness probes.
-    """
-    try:
-        health_status = await health_checker.get_health_status(detailed=False)
-        status_code = 503 if health_status.status == HealthStatus.UNHEALTHY else 200
-
-        return JSONResponse(
-            status_code=status_code,
-            content={
-                "status": "ready" if status_code == 200 else "not ready",
-                "health": health_status.status,
-                "version": health_status.version,
-            },
-        )
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not ready", "reason": f"health check failed: {str(e)}"},
-        )
-
-
-@app.get("/health/detailed")
-async def detailed_health_check():
-    """
-    Comprehensive health status with component details.
-    """
-    try:
-        health_status = await health_checker.get_health_status(detailed=True)
-        status_code = 200
-        if health_status.status == HealthStatus.UNHEALTHY:
-            status_code = 503
-        elif health_status.status == HealthStatus.DEGRADED:
-            status_code = 200  # Degraded is still operational
-
-        return JSONResponse(status_code=status_code, content=health_status.model_dump())
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": f"Health check system failure: {str(e)}"},
-        )
-
-
 app.include_router(get_auth_router(), prefix="/api/v1/auth", tags=["auth"])
 
 app.include_router(
@@ -226,9 +216,13 @@ app.include_router(
     tags=["auth"],
 )
 
+app.include_router(get_api_key_management_router(), prefix="/api/v1/auth", tags=["auth"])
+
 app.include_router(get_add_router(), prefix="/api/v1/add", tags=["add"])
 
 app.include_router(get_cognify_router(), prefix="/api/v1/cognify", tags=["cognify"])
+
+app.include_router(get_memify_router(), prefix="/api/v1/memify", tags=["memify"])
 
 app.include_router(get_search_router(), prefix="/api/v1/search", tags=["search"])
 
@@ -240,23 +234,84 @@ app.include_router(
 
 app.include_router(get_datasets_router(), prefix="/api/v1/datasets", tags=["datasets"])
 
+app.include_router(get_ontology_router(), prefix="/api/v1/ontologies", tags=["ontologies"])
+
 app.include_router(get_settings_router(), prefix="/api/v1/settings", tags=["settings"])
 
 app.include_router(get_visualize_router(), prefix="/api/v1/visualize", tags=["visualize"])
 
+app.include_router(
+    get_configuration_router(),
+    prefix="/api/v1/configuration",
+    tags=["configuration"],
+)
+
 app.include_router(get_delete_router(), prefix="/api/v1/delete", tags=["delete"])
+
+app.include_router(get_update_router(), prefix="/api/v1/update", tags=["update"])
 
 app.include_router(get_responses_router(), prefix="/api/v1/responses", tags=["responses"])
 
-codegraph_routes = get_code_pipeline_router()
-if codegraph_routes:
-    app.include_router(codegraph_routes, prefix="/api/v1/code-pipeline", tags=["code-pipeline"])
+app.include_router(get_llm_router(), prefix="/api/v1/llm", tags=["llm"])
+
+app.include_router(get_sync_router(), prefix="/api/v1/sync", tags=["sync"])
 
 app.include_router(
     get_users_router(),
     prefix="/api/v1/users",
     tags=["users"],
 )
+
+app.include_router(
+    get_user_id_by_email_router(),
+    prefix="/api/v1/users",
+    tags=["users"],
+)
+
+app.include_router(
+    get_notebooks_router(),
+    prefix="/api/v1/notebooks",
+    tags=["notebooks"],
+)
+
+app.include_router(
+    get_checks_router(),
+    prefix="/api/v1/checks",
+    tags=["checks"],
+)
+
+app.include_router(
+    get_health_router(),
+    prefix="/health",
+    tags=["health"],
+)
+
+# Activity / observability
+app.include_router(
+    get_activity_router(),
+    prefix="/api/v1/activity",
+    tags=["activity"],
+)
+
+# Sessions lifecycle + dashboard aggregates
+app.include_router(
+    get_sessions_router(),
+    prefix="/api/v1/sessions",
+    tags=["sessions"],
+)
+
+app.include_router(get_remember_router(), prefix="/api/v1/remember", tags=["remember"])
+app.include_router(get_recall_router(), prefix="/api/v1/recall", tags=["recall"])
+app.include_router(get_improve_router(), prefix="/api/v1/improve", tags=["improve"])
+app.include_router(get_forget_router(), prefix="/api/v1/forget", tags=["forget"])
+
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint that returns a welcome message.
+    """
+    return {"message": "Hello, World, I am alive!"}
 
 
 def start_api_server(host: str = "0.0.0.0", port: int = 8000):

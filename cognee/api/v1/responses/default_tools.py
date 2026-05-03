@@ -14,7 +14,6 @@ DEFAULT_TOOLS = [
                     "type": "string",
                     "description": "Type of search to perform",
                     "enum": [
-                        "INSIGHTS",
                         "CODE",
                         "GRAPH_COMPLETION",
                         "NATURAL_LANGUAGE",
@@ -48,6 +47,10 @@ DEFAULT_TOOLS = [
                 "ontology_file_path": {
                     "type": "string",
                     "description": "Path to a custom ontology file",
+                },
+                "custom_prompt": {
+                    "type": "string",
+                    "description": "Custom prompt for entity extraction and graph generation. If provided, this prompt will be used instead of the default prompts.",
                 },
             },
             "required": ["text"],

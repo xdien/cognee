@@ -1,11 +1,14 @@
+from uuid import UUID
+from deprecated import deprecated
 from fastapi import Depends
 from fastapi.responses import JSONResponse
 from fastapi import APIRouter
-from uuid import UUID
+
 from cognee.shared.logging_utils import get_logger
 from cognee.modules.users.models import User
 from cognee.modules.users.methods import get_authenticated_user
 from cognee.shared.utils import send_telemetry
+from cognee import __version__ as cognee_version
 
 logger = get_logger()
 
@@ -13,12 +16,17 @@ logger = get_logger()
 def get_delete_router() -> APIRouter:
     router = APIRouter()
 
-    @router.delete("", response_model=None)
+    @router.delete("", response_model=None, deprecated=True)
+    @deprecated(
+        reason="DELETE /v1/delete is deprecated. Use DELETE /v1/datasets/{dataset_id}/data/{data_id} instead.",
+        version="0.3.9",
+    )
     async def delete(
         data_id: UUID,
         dataset_id: UUID,
         mode: str = "soft",
         user: User = Depends(get_authenticated_user),
+        delete_dataset_if_empty: bool = False,
     ):
         """Delete data by its ID from the specified dataset.
 
@@ -27,6 +35,7 @@ def get_delete_router() -> APIRouter:
             dataset_id: The UUID of the dataset containing the data
             mode: "soft" (default) or "hard" - hard mode also deletes degree-one entity nodes
             user: Authenticated user
+            delete_dataset_if_empty: If True, deletes the dataset if it is left empty after data deletion
 
         Returns:
             JSON response indicating success or failure
@@ -39,17 +48,19 @@ def get_delete_router() -> APIRouter:
                 "endpoint": "DELETE /v1/delete",
                 "dataset_id": str(dataset_id),
                 "data_id": str(data_id),
+                "cognee_version": cognee_version,
             },
         )
 
-        from cognee.api.v1.delete import delete as cognee_delete
+        from cognee.api.v1.datasets import datasets
 
         try:
-            result = await cognee_delete(
-                data_id=data_id,
+            result = await datasets.delete_data(
                 dataset_id=dataset_id,
-                mode=mode,
+                data_id=data_id,
                 user=user,
+                mode=mode,
+                delete_dataset_if_empty=delete_dataset_if_empty,
             )
             return result
 
