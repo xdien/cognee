@@ -296,13 +296,15 @@ async def get_session_row(
     *,
     session_id: str,
     user_id: UUIDType,
+    user_ids: Optional[list[UUIDType]] = None,
     permitted_dataset_ids: Optional[list[UUIDType]] = None,
     prefer_other_owner: bool = False,
 ) -> Optional[SessionRecord]:
     """Fetch a session row visible to the caller.
 
-    Returns the row if the caller owns the session OR if the session's
-    dataset is in ``permitted_dataset_ids``. Returns None otherwise.
+    Returns the row if the caller (or their child agents, via
+    ``user_ids``) owns the session OR if the session's dataset is in
+    ``permitted_dataset_ids``. Returns None otherwise.
 
     The same ``session_id`` can exist under multiple owners (it's only
     unique per user in the composite PK). When the query matches
@@ -312,7 +314,10 @@ async def get_session_row(
     """
     engine = get_relational_engine()
     async with engine.get_async_session() as session:
-        visibility_terms = [SessionRecord.user_id == user_id]
+        if user_ids is not None and len(user_ids) > 0:
+            visibility_terms = [SessionRecord.user_id.in_(user_ids)]
+        else:
+            visibility_terms = [SessionRecord.user_id == user_id]
         if permitted_dataset_ids:
             visibility_terms.append(SessionRecord.dataset_id.in_(permitted_dataset_ids))
         result = await session.execute(
@@ -365,6 +370,7 @@ class SessionListPage:
 async def list_session_rows(
     *,
     user_id: Optional[UUIDType] = None,
+    user_ids: Optional[list[UUIDType]] = None,
     permitted_dataset_ids: Optional[list[UUIDType]] = None,
     since: Optional[datetime] = None,
     status_filter: Optional[str] = None,
@@ -375,10 +381,10 @@ async def list_session_rows(
 ) -> SessionListPage:
     """List sessions with pagination metadata.
 
-    Visibility: returns sessions the caller owns OR sessions whose
-    ``dataset_id`` is in ``permitted_dataset_ids`` (read permission
-    granted at the dataset level). This mirrors the activity feed,
-    which scopes by dataset permissions rather than strict ownership.
+    Visibility: returns sessions the caller owns (or their child
+    agents own, via ``user_ids``) OR sessions whose ``dataset_id``
+    is in ``permitted_dataset_ids`` (read permission granted at the
+    dataset level).
 
     status_filter accepts the effective status (including
     ``abandoned``) — the SQL predicate handles the abandoned-by-time
@@ -390,7 +396,9 @@ async def list_session_rows(
 
         # Ownership / permission predicate.
         visibility_terms = []
-        if user_id is not None:
+        if user_ids is not None and len(user_ids) > 0:
+            visibility_terms.append(SessionRecord.user_id.in_(user_ids))
+        elif user_id is not None:
             visibility_terms.append(SessionRecord.user_id == user_id)
         if permitted_dataset_ids:
             visibility_terms.append(SessionRecord.dataset_id.in_(permitted_dataset_ids))
@@ -450,3 +458,36 @@ async def ensure_session(*, session_id, user_id, dataset_id=None):
 async def touch_session(*, session_id, user_id, dataset_id=None):
     """Deprecated: prefer ``ensure_and_touch_session``."""
     await ensure_and_touch_session(session_id=session_id, user_id=user_id, dataset_id=dataset_id)
+
+
+_session_record_write_failed = False
+
+
+async def record_session_activity(user_id: str, session_id: str, *, errored: bool = False) -> None:
+    """Write a lifecycle heartbeat for a session: upsert + touch the SessionRecord row.
+
+    Accepts a string ``user_id`` (coerced to UUID). Swallows failures — the
+    session_records table is optional for SessionManager correctness — but logs once at
+    WARNING per process so silent breakage stays visible in ops.
+    """
+    global _session_record_write_failed
+
+    try:
+        try:
+            user_uuid = UUIDType(str(user_id))
+        except (ValueError, TypeError):
+            return
+
+        await ensure_and_touch_session(session_id=session_id, user_id=user_uuid)
+        if errored:
+            await accumulate_usage(session_id=session_id, user_id=user_uuid, errored=True)
+    except Exception as exc:
+        if not _session_record_write_failed:
+            _session_record_write_failed = True
+            logger.warning(
+                "session_records write failed (%s); subsequent failures will log at debug. "
+                "Check alembic migrations for the session_records table.",
+                exc,
+            )
+        else:
+            logger.debug("session_records write failed (%s)", exc)

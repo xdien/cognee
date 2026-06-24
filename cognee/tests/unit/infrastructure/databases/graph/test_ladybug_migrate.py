@@ -9,9 +9,8 @@ import pytest
 
 from cognee.infrastructure.databases.graph.ladybug.ladybug_migrate import (
     ladybug_version_mapping,
-    read_ladybug_storage_version,
     run_migration_step,
-    try_read_ladybug_storage_version,
+    read_ladybug_storage_version,
 )
 
 
@@ -36,6 +35,19 @@ def test_read_ladybug_storage_version_known_code(tmp_path):
     assert read_ladybug_storage_version(str(tmp_path)) == expected
 
 
+def test_ladybug_version_mapping_covers_0_16_and_0_17_storage_codes():
+    # Storage codes are shared within a minor release line: 0.16.x writes code
+    # 40, 0.17.x writes code 41 (verified against the published wheels). The
+    # mapping holds one release per format, so 0.16.1 reuses the 0.16.0 entry.
+    assert ladybug_version_mapping[40] == "0.16.0"
+    assert ladybug_version_mapping[41] == "0.17.1"
+
+
+def test_read_ladybug_storage_version_0_17_code(tmp_path):
+    _write_catalog_kz(str(tmp_path), 41)
+    assert read_ladybug_storage_version(str(tmp_path)) == "0.17.1"
+
+
 def test_read_ladybug_storage_version_unknown_code_raises(tmp_path):
     # Anything outside the known table — e.g., a code emitted by a newer
     # ladybug release that hasn't been added yet.
@@ -43,27 +55,6 @@ def test_read_ladybug_storage_version_unknown_code_raises(tmp_path):
     _write_catalog_kz(str(tmp_path), unknown)
     with pytest.raises(ValueError, match="Could not map version_code"):
         read_ladybug_storage_version(str(tmp_path))
-
-
-def test_try_read_storage_version_unknown_code_returns_none(tmp_path):
-    """Regression: ladybug 0.16.0 fresh DB writes a code that's not in the
-    mapping (which currently tops out at 0.11.3). The runtime bootstrap
-    must not crash — try_read_* returns None so the caller can skip the
-    legacy migration path."""
-    unknown = max(ladybug_version_mapping.keys()) + 100
-    _write_catalog_kz(str(tmp_path), unknown)
-    assert try_read_ladybug_storage_version(str(tmp_path)) is None
-
-
-def test_try_read_storage_version_missing_catalog_returns_none(tmp_path):
-    # Truly fresh path — no catalog.kz yet.
-    assert try_read_ladybug_storage_version(str(tmp_path)) is None
-
-
-def test_try_read_storage_version_known_code(tmp_path):
-    code, expected = next(iter(ladybug_version_mapping.items()))
-    _write_catalog_kz(str(tmp_path), code)
-    assert try_read_ladybug_storage_version(str(tmp_path)) == expected
 
 
 def test_run_migration_step_isolates_legacy_import_path(monkeypatch):
@@ -75,7 +66,7 @@ def test_run_migration_step_isolates_legacy_import_path(monkeypatch):
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(
-        "cognee.infrastructure.databases.graph.ladybug.ladybug_migrate.subprocess.run",
+        "cognee_db_workers.ladybug_migrate.subprocess.run",
         fake_run,
     )
 

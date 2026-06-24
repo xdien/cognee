@@ -1,6 +1,7 @@
 """Adapter for Instructor-backed Structured Output Framework for Llama CPP"""
 
 import logging
+import threading
 from typing import Any, cast
 
 import instructor
@@ -12,17 +13,23 @@ from tenacity import (
     before_sleep_log,
     retry,
     retry_if_not_exception_type,
-    stop_after_delay,
+    stop_after_attempt,
     wait_exponential_jitter,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.types import (
+    TranscriptionReturnType,
 )
 
 from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.llm_interface import (
     LLMInterface,
 )
+from cognee.modules.observability.get_observe import get_observe
 from cognee.shared.logging_utils import get_logger
 from cognee.shared.rate_limiting import llm_rate_limiter_context_manager
 
 logger = get_logger()
+
+observe = get_observe()
 
 
 class LlamaCppAPIAdapter(LLMInterface):
@@ -104,6 +111,13 @@ class LlamaCppAPIAdapter(LLMInterface):
         self.model_path = model_path
         self.model = None
 
+        # llama_cpp.Llama is not thread-safe: it has a single context, KV cache and
+        # logits buffer with no internal locking. cognee fans out extraction across
+        # chunks with asyncio.gather, and each call runs via asyncio.to_thread, so
+        # without this lock multiple threads decode on the same instance concurrently
+        # and corrupt its state, aborting the process with a native GGML_ASSERT.
+        self._local_lock = threading.Lock()
+
         # Initialize llama-cpp-python with the model
         self.llama = llama_cpp.Llama(
             model_path=model_path,
@@ -134,13 +148,14 @@ class LlamaCppAPIAdapter(LLMInterface):
             mode=instructor.Mode(self.instructor_mode),
         )
 
+    @observe(as_type="generation")
     @retry(
-        stop=stop_after_delay(128),
+        stop=stop_after_attempt(3),
         wait=wait_exponential_jitter(8, 128),
         retry=retry_if_not_exception_type(
             (litellm.exceptions.NotFoundError, litellm.exceptions.AuthenticationError)
         ),
-        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
     async def acreate_structured_output(
@@ -184,13 +199,21 @@ class LlamaCppAPIAdapter(LLMInterface):
                 import asyncio
 
                 def _call_sync():
-                    return cast(InstructorChatCompletionCreate, self.aclient)(
-                        messages=messages,
-                        response_model=response_model,
-                        **merged_kwargs,
-                    )
+                    # Serialize decodes on the shared, non-thread-safe Llama instance.
+                    with self._local_lock:
+                        return cast(InstructorChatCompletionCreate, self.aclient)(
+                            messages=messages,
+                            response_model=response_model,
+                            **merged_kwargs,
+                        )
 
                 # Run sync function in thread pool to avoid blocking
                 response = await asyncio.to_thread(_call_sync)
 
         return response
+
+    async def create_transcript(self, input: str, **kwargs: Any) -> TranscriptionReturnType:
+        raise NotImplementedError
+
+    async def transcribe_image(self, input: str, **kwargs: Any) -> str:
+        raise NotImplementedError
